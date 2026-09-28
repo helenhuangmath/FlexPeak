@@ -1,0 +1,10 @@
+# Simulated BAMs: ~78 MB, regenerated deterministically by run_benchmark.py
+# from fixed seeds, so there is no reason to version them.
+data/
+
+# Unmodified MACS output (xls, summits). The parsed calls are kept in
+# results/calls/ instead, which is what the metrics were computed from.
+results/macs_raw/
+
+__pycache__/
+*.pyc

@@ -1,0 +1,33 @@
+Current problem:
+Peak calling like MACS2 works best for narrow peaks, but not broad peaks or mixed peaks. Other programs like Sicer or xxx for broad peak calling is too broad. There lacks a good tool which can dynamically and more accurately call peaks which could reflect the biological truth. Some data has better quality and some data has poor quality, the peak calling algorithm by far showed not very well performance for data with low quality. 
+
+I want to create a new Python packages like macs2 for peak calling, it is an improved version can dynamically call peaks based on histone and TF marks features, for example there will be both sharp and narrow peaks in H3K9me3, the program can adjust based on input marks, can tune the parameters based on given bam files or bw files. 
+The base model is generated or trained on all Encode genome data, (may borrow AlphaGenome features or data). 
+Then the program can automatically QC the peaks, and annotate the peaks. 
+To make it run fast like MACS2, we could use 1 or 2 chromesomes to tune peak calling parameters. 
+
+I want to emphasize its flexibility and ability, core feature include AI training, speed and mixed peak capability
+
+FlexPeak
+DeepPeak
+AdaptPeak
+DAPC: Dynamic and Adaptive Peak Caller.
+SmartPeak 
+SmartMACS
+PeakScope
+
+ChromAI
+ ├── Peak Calling
+ ├── Peak QC
+ ├── Peak Annotation
+
+
+Macs2 limitation: 
+Background: negative-binomial GLM with mappability/GC/copy-number covariates, not MACS2's local Poisson. 
+    Poisson assumes mean = variance; real background is overdispersed, which is precisely why MACS2's FDR becomes meaningless on noisy libraries. 
+    This one change addresses your low-quality complaint before any ML is involved.
+
+
+
+
+
