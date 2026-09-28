@@ -1,0 +1,18 @@
+FlexPeak peak statistics
+============================================================
+  source                     /Users/hhua/Desktop/Berger_Wherry_Lab/0_Projects/0_HH_Projects/GitHub/FlexPeak/testing/data/GSE285245_pool_H3K9me3_Cl13.bw
+  regions called             374
+    broad domains            226
+    focal peaks              148
+  nested sub-peaks           1,344
+  chromosomes with peaks     1
+  total peak territory       2.75 Mb
+  genome fraction            4.48%
+  median width               6,000 bp
+  width IQR                  3,600-8,400 bp
+  max width                  42.0 kb
+  median fold enrichment     4.28
+  median -log10 q            9.92
+  median sub-peak width      1,200 bp
+
+  NOTE: input was not raw counts; p/q-values are approximate.

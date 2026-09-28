@@ -1,0 +1,5 @@
+# Real-data inputs and outputs: large, machine-specific, and re-derivable by
+# rerunning the script.  The script and README carry the source URL/provenance.
+data/
+cache/
+results/
