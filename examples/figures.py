@@ -259,15 +259,28 @@ def fig1():
     ax_call.text(0.995, 0.27, "sub-peaks", transform=ax_call.transAxes, ha="right",
                  va="center", fontsize=FS_NOTE, color=INK)
 
+    # Caption from the data, not from memory: count truth sub-peaks that a
+    # called sub-peak overlaps, and called sub-peaks that overlap no truth.
+    hit = sum(1 for ts, te, _ in best_region.subpeaks
+              if any(c.start < te and c.end > ts for c in best.subpeaks))
+    extra = sum(1 for c in best.subpeaks
+                if not any(c.start < te and c.end > ts
+                           for ts, te, _ in best_region.subpeaks))
+    n_true = len(best_region.subpeaks)
+    first = (f"The domain boundaries and {hit} of {n_true} true sub-peaks are "
+             f"recovered, with {extra} false sub-peak{'s' if extra != 1 else ''} "
+             f"inside the domain.")
+    if extra == 0 and hit == n_true:
+        second = ("Sub-peaks inside a domain are tested against the domain's own "
+                  "level and gated against the sample's distribution of candidate\n"
+                  "maxima (DESIGN.md §3.3), so background fluctuation on the "
+                  "plateau is not reported as structure.")
+    else:
+        second = ("Sub-peaks inside a domain are tested against the domain's own "
+                  "level (DESIGN.md §3.3); subpeak_domain_z and min_persistence\n"
+                  "trade the remaining false sub-peaks against sensitivity.")
     fig.subplots_adjust(bottom=0.21)
-    fig.text(0.013, 0.10,
-             f"The domain boundaries and the {len(best_region.subpeaks)} true "
-             f"sub-peaks are all recovered — but {best.n_subpeaks} sub-peaks "
-             f"were called in total.\n"
-             f"The scale-space detector also fires on background fluctuation "
-             f"inside a flat domain. False sub-peak rate inside domains is a "
-             f"known\nopen item (DESIGN.md §9.4), not a solved one; "
-             f"min_persistence is the knob that trades it against sensitivity.",
+    fig.text(0.013, 0.10, first + "\n" + second,
              fontsize=FS_NOTE, color=INK, va="top", linespacing=1.5)
     _save(fig, "fig1_nested_calls.png")
 
@@ -330,7 +343,7 @@ def fig2():
                   "overdispersed, so a Poisson caller reports inflated "
                   "significance\nand its FDR stops meaning anything — which is "
                   "why this test is run on every commit "
-                  "(tests/test_background.py).")
+                  "(tests/test_tune_and_calls.py).")
 
     _save(fig, "fig2_negative_control.png")
 
@@ -522,7 +535,7 @@ def fig6():
     result = tune(
         data.treatment, data.control,
         base=preset_params("h3k9me3").replace(bin_size=25),
-        grid=grid, n_chroms=2, thin_fractions=(0.5,), seeds=(0,),
+        grid=grid, n_chroms=2,
     )
 
     cuts = list(grid["posterior_cutoff"])
@@ -566,7 +579,7 @@ def fig6():
     ax.set_yticks(range(len(folds)), [str(f) for f in folds])
     ax.grid(False)
     cb = fig.colorbar(im, ax=ax, fraction=0.045, pad=0.03)
-    cb.set_label("objective (stability − territory penalty)", color=INK,
+    cb.set_label("objective (held-out fit + split stability − territory penalty)", color=INK,
                  fontsize=FS_LABEL)
     cb.outline.set_visible(True)
     cb.outline.set_edgecolor(INK)

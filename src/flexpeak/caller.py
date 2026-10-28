@@ -7,6 +7,7 @@ from dataclasses import dataclass, asdict, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+from scipy.ndimage import uniform_filter1d
 
 from .background.nb import BackgroundModel, check_window_scale
 from .peaks import NestedPeakSet, Region, SubPeak
@@ -33,9 +34,71 @@ class CallParams:
     max_gap: int = 0
     """Merge regions separated by <= max_gap bp.  0 disables (the HMM already
     infers boundaries; this exists for compatibility, not as a tuning knob)."""
-    min_fold: float = 1.5
+    min_fold: float = 1.2
+    """Effect-size floor on a region's observed/expected fold.
+
+    It was 1.5, which silently erased weak broad marks: the background is a
+    max over windows and so sits a little above the true level, and a 1.6x
+    domain measures ~1.35x against it.  On the low-quality benchmark (1.6x
+    domains, dispersion 0.4) that took base-pair F1 from 96% at 1.2 to 13% at
+    1.5 with nothing else changed.  Significance, not this floor, is what keeps
+    noise out -- see ``fdr_scope``."""
     qvalue: float = 0.05
+    fdr_scope: str = "genome"
+    """Multiplicity the region-level BH correction is taken over.
+
+    ``"genome"``: as many tests as candidate-sized tiles fit in the genome
+    (genome size / median candidate width).  The HMM *scanned* the whole
+    genome before handing over its candidates, so correcting over only the
+    handful it returned is selection without paying for it -- on the null
+    benchmark that let 16 noise regions through at ``min_fold=1.2``; with the
+    genome-wide count it is 2, below the 3 the old 1.5 floor allowed.
+    ``"candidates"``: BH over the returned regions only (the old behaviour)."""
     min_persistence: int = 2
+    subpeak_descent_level: int = 1
+    """Which smoothing level sub-peak boundaries are walked on; see
+    ``find_subpeaks(descent_level=...)``.  0 is the raw-signal ablation."""
+    subpeak_vs_domain: bool = True
+    """Inside a domain, judge sub-peaks against the domain's own level.
+
+    A sub-peak nested in a domain claims focal structure *on top of* the
+    domain, so that is what it must be tested against; tested against genome
+    background every bump on a 2.5x plateau is "enriched".  The domain level
+    is the median of the 1 kb-smoothed fold inside the region, and the fold
+    floor and the NB test both use ``mu`` scaled by it.  Measured on the
+    benchmark: the 1.6x low-quality domains, which contain no focal peaks,
+    went from ~150 reported sub-peaks to none, while all 18 true focal peaks
+    in the mixed domains stayed (-log10 p 15-29 against the domain, versus a
+    95th percentile of 1.3-3.9 for the noise).
+
+    The test is deliberately run *without* the genome-wide autocorrelation
+    inflation.  That factor is estimated at domain scale and conditioning on
+    the domain level is what removes it; applied anyway it is ~14x on the
+    mixed benchmark and buries the true focal peaks at -log10 p ~2.  Off:
+    everything is tested against genome background (ablation)."""
+    subpeak_domain_z: float = 4.0
+    """Outlier gate for sub-peaks inside a domain, in robust sigmas.
+
+    Sub-peak candidates are local maxima, so their p-values are not uniform
+    under the null -- they are the upper tail by construction, and BH on them
+    passed a third of the noise bumps on the low-quality domains.  But a
+    domain supplies its own null: nearly all of its candidate maxima are
+    noise, so the median and MAD of their log fold over the domain level
+    measure that noise directly, and a real focal peak is an outlier against
+    it.  Measured on the benchmark, every true focal peak scored z >= 5.1 and
+    none of ~2,400 noise candidates exceeded 3.8.  The gate self-calibrates:
+    a noisier library widens its own null.
+
+    The null is pooled over every domain in the sample: each candidate's fold
+    is already relative to its own domain's level, so they are comparable,
+    and pooling is what lets a 3 kb domain with four candidates be judged
+    at all.  Needs ``subpeak_domain_min_candidates`` candidates in the pool;
+    0 disables the gate."""
+    subpeak_domain_min_candidates: int = 10
+    min_subpeak_width: Optional[int] = None
+    """Narrowest sub-peak reported, bp.  None means one detection bandwidth
+    at the descent level (150 bp by default): a footprint narrower than the
+    smoothing that found it is a single-bin spike, not a feature."""
     call_subpeaks: bool = True
     domain_min_width: int = 2000
     """Regions at least this wide are labelled ``domain`` rather than ``peak``."""
@@ -82,6 +145,19 @@ class CallParams:
     below the scale the data has.  See NBHMM.min_stay_enriched."""
     segment_bins_per_scale: int = 8
     """How many segmentation bins span one autocorrelation length."""
+    min_segment_bin_bp: int = 100
+    """Floor on the *automatically* chosen segmentation bin.
+
+    The autocorrelation length collapses to a single bin on a weak or
+    overdispersed library -- sparsity decorrelates a signal that is really
+    continuous -- and then the HMM decides a state per 25 bp bin, which no
+    sparse bin can support: a 1.6x domain came back as ~50 fragments and pure
+    noise grew a "weak" state at 1.7x.  Four bins is the smallest unit that
+    carries a decision.  Measured: free on every full-size benchmark set
+    (mixed +0.7 F1), 6x fewer false calls on a small null genome, and the
+    shredded weak domains went from F1 0.50 to 0.78 (the tuner takes them the
+    rest of the way).  200 bp already costs TF-scale peaks (0.93 -> 0.88).
+    Not applied to an explicit ``segment_bin_size``."""
     max_dwell: int = 100_000
     """Cap on that floor, in bp -- a degenerate autocorrelation estimate on a
     short or repetitive contig must not turn the chromosome into one region."""
@@ -154,11 +230,23 @@ def call_peaks(
     covariates: Optional[Dict[str, Dict[str, np.ndarray]]] = None,
     blacklist: Optional[Sequence[Tuple[str, int, int]]] = None,
     return_details: bool = False,
+    background: Optional[BackgroundModel] = None,
+    segmentation_cache: Optional[Dict] = None,
 ):
     """Call nested peaks on binned coverage.
 
     Returns a :class:`NestedPeakSet`, or a :class:`CallResult` if
     ``return_details`` is set (used by QC and by the tuning sweep).
+
+    ``background`` reuses an already fitted model for this exact treatment,
+    control and bin size -- the tuning sweep varies nothing the background
+    depends on, so refitting it at every grid point is pure waste.
+
+    ``segmentation_cache`` is a dict, owned by the caller, that keeps each
+    chromosome's HMM fit keyed on the settings the fit depends on.  The
+    posterior cutoff, ``min_fold`` and everything downstream of the posterior
+    leave the fit unchanged, so a sweep over them fits the HMM once instead of
+    at every grid point.  Pass one dict per (treatment, background) pair.
     """
     params = params or CallParams()
 
@@ -187,12 +275,8 @@ def call_peaks(
     if msg:
         warnings.warn(msg, stacklevel=2)
 
-    bg = BackgroundModel.fit(
-        treatment, control=control, windows=params.windows, covariates=covariates,
-        exclude_fold=params.background_exclude_fold,
-        exclude_iters=params.background_exclude_iters,
-        exclude_smooth_bp=params.background_exclude_smooth_bp,
-    )
+    bg = background if background is not None else fit_background(
+        treatment, control, params, covariates)
 
     bs = treatment.bin_size
     min_bins = max(1, params.min_width // bs)
@@ -203,7 +287,10 @@ def call_peaks(
     # bin and the HMM dwell floor.  Per chromosome it is too unstable to trust
     # (see signal_scale_bp), and a setting that silently switches off on half
     # the chromosomes is worse than one that is simply wrong.
-    scale_bp = signal_scale_bp(treatment)
+    cache = segmentation_cache if segmentation_cache is not None else {}
+    if "signal_scale_bp" not in cache:
+        cache["signal_scale_bp"] = signal_scale_bp(treatment)
+    scale_bp = cache["signal_scale_bp"]
     seg_bs = _segment_bin_size(treatment, params, scale_bp)
     factor = max(1, seg_bs // bs)
     diagnostics["signal_scale_bp"] = int(scale_bp)
@@ -246,15 +333,21 @@ def call_peaks(
                 factor * bs, params),
             fit_state_dispersion=params.hmm_fit_state_dispersion,
         )
-        _, res = segment_chromosome(
-            c_seg, mu_seg, alpha_seg,
-            posterior_cutoff=params.posterior_cutoff,
-            min_bins=1,
-            hmm=hmm,
-        )
-        posterior = (np.repeat(res.posterior, factor)[: counts.size]
-                     if factor > 1 else res.posterior)
-        res.posterior = posterior
+        key = (chrom, factor, hmm.stay_background, hmm.stay_enriched,
+               hmm.min_stay_enriched, hmm.fit_state_dispersion,
+               params.background_model)
+        res = cache.get(key)
+        if res is None:
+            _, res = segment_chromosome(
+                c_seg, mu_seg, alpha_seg,
+                posterior_cutoff=params.posterior_cutoff,
+                min_bins=1,
+                hmm=hmm,
+            )
+            if factor > 1:
+                res.posterior = np.repeat(res.posterior, factor)[: counts.size]
+            cache[key] = res
+        posterior = res.posterior
         intervals = _runs(posterior >= params.posterior_cutoff, min_bins)
         intervals = _merge_close(intervals, params.max_gap // bs if params.max_gap else 0)
         diagnostics["chroms"][chrom] = {
@@ -305,6 +398,7 @@ def call_peaks(
         chrom_sizes=dict(treatment.chrom_sizes),
     )
 
+    _gate_domain_subpeaks(peaks, params)
     peaks = _apply_fdr(peaks, params)
     if blacklist:
         before = len(peaks)
@@ -316,6 +410,28 @@ def call_peaks(
     if return_details:
         return CallResult(peaks=peaks, background=bg, params=params, diagnostics=diagnostics)
     return peaks
+
+
+#: CallParams fields the background model depends on.  A fitted background can
+#: be reused across settings that differ only in fields outside this set.
+BACKGROUND_FIELDS = frozenset({
+    "bin_size", "windows", "background_exclude_fold",
+    "background_exclude_iters", "background_exclude_smooth_bp",
+})
+
+
+def fit_background(treatment: Coverage, control: Optional[Coverage],
+                   params: CallParams, covariates=None) -> BackgroundModel:
+    """The background ``call_peaks`` would fit for these inputs and parameters.
+
+    Coverage must already be at ``params.bin_size``.
+    """
+    return BackgroundModel.fit(
+        treatment, control=control, windows=params.windows, covariates=covariates,
+        exclude_fold=params.background_exclude_fold,
+        exclude_iters=params.background_exclude_iters,
+        exclude_smooth_bp=params.background_exclude_smooth_bp,
+    )
 
 
 def _aggregate_alpha(mu: np.ndarray, alpha: np.ndarray, factor: int,
@@ -391,7 +507,8 @@ def _segment_bin_size(treatment: Coverage, params: CallParams,
     bs = treatment.bin_size
     cap = max(bs, int(params.domain_min_width) // 4)
     seg = (int(scale_bp / max(params.segment_bins_per_scale, 1)) // bs) * bs
-    return int(np.clip(seg, bs, cap))
+    floor = max(bs, (int(params.min_segment_bin_bp) // bs) * bs)
+    return int(np.clip(seg, floor, cap))
 
 
 def _dwell_floor(scale_bp: float, bin_size: int, params: CallParams) -> float:
@@ -454,9 +571,19 @@ def _call_subpeaks(chrom, b0, b1, counts, mu, alpha, bin_size, chrom_len,
     lo = max(0, b0 - pad)
     hi = min(counts.size, b1 + pad)
     seg = counts[lo:hi]
-    seg_bg = mu[lo:hi]
     if seg.size < 3:
         return []
+
+    # Inside a domain the reference level is the domain, not the genome.
+    is_domain = (b1 - b0) * bin_size >= params.domain_min_width
+    if params.subpeak_vs_domain and is_domain:
+        k = max(1, int(1000 / bin_size))
+        local = (uniform_filter1d(counts[b0:b1], k, mode="nearest")
+                 / np.maximum(uniform_filter1d(mu[b0:b1], k, mode="nearest"), 1e-9))
+        level = max(1.0, float(np.median(local)))
+        mu = mu * level
+        inflation = 1.0
+    seg_bg = mu[lo:hi]
 
     maxima = find_subpeaks(
         seg, bin_size, background=seg_bg,
@@ -465,36 +592,77 @@ def _call_subpeaks(chrom, b0, b1, counts, mu, alpha, bin_size, chrom_len,
         min_fold=params.min_fold,
         boundary_fraction=params.boundary_fraction,
         offset=lo,
+        descent_level=params.subpeak_descent_level,
     )
 
-    subs: List[SubPeak] = []
-    for m in maxima:
-        # Keep only summits inside the parent region.
-        if not (b0 <= m.index < b1):
-            continue
-        s0, s1 = max(m.start, b0), min(m.end, b1)
-        if s1 <= s0:
-            continue
-        obs = float(counts[s0:s1].sum())
-        exp = float(mu[s0:s1].sum())
-        if exp <= 0:
-            continue
-        fold = obs / exp
-        mu_tot, a = aggregate_nb_params(mu[s0:s1], alpha[s0:s1], inflation=inflation)
-        nlp = float(nb_neglog10_sf(np.array([obs]), np.array([mu_tot]), np.array([a]))[0])
+    # Keep only summits inside the parent region, clipped to it.
+    maxima = [m for m in maxima
+              if b0 <= m.index < b1 and min(m.end, b1) > max(m.start, b0)]
+    if not maxima:
+        return []
+    s0 = np.array([max(m.start, b0) for m in maxima]) - b0
+    s1 = np.array([min(m.end, b1) for m in maxima]) - b0
 
-        start = min(s0 * bin_size, chrom_len)
-        end = min(s1 * bin_size, chrom_len)
-        summit = min(m.index * bin_size + bin_size // 2, chrom_len - 1)
+    # Every candidate's statistics from prefix sums and one vectorised NB
+    # test.  A large domain can hold thousands of candidates, and testing them
+    # one call at a time was ~90% of the whole call.  Same arithmetic as
+    # aggregate_nb_params, applied to all candidates at once.
+    def _prefix(a):
+        return np.concatenate([[0.0], np.cumsum(a[b0:b1], dtype=np.float64)])
+
+    pc, pm = _prefix(counts), _prefix(mu)
+    pv = _prefix(np.asarray(alpha, dtype=np.float64) * mu * mu)
+    obs = pc[s1] - pc[s0]
+    exp = pm[s1] - pm[s0]
+    ok = exp > 0
+    exp_safe = np.where(ok, exp, 1.0)
+    var = (inflation if inflation is not None else 1.0) * (exp_safe + pv[s1] - pv[s0])
+    a_eff = np.maximum((var - exp_safe) / (exp_safe * exp_safe), 1e-10)
+    nlp = nb_neglog10_sf(obs, exp_safe, a_eff)
+
+    min_w = params.min_subpeak_width
+    if min_w is None:
+        lvl = int(np.clip(params.subpeak_descent_level, 0, len(params.bandwidths) - 1))
+        min_w = int(params.bandwidths[lvl])
+    keep = ok & ((s1 - s0) * bin_size >= min_w)
+
+    subs: List[SubPeak] = []
+    for i, m in enumerate(maxima):
+        if not keep[i]:
+            continue
+        start = min((s0[i] + b0) * bin_size, chrom_len)
+        end = min((s1[i] + b0) * bin_size, chrom_len)
         if end <= start:
             continue
+        summit = min(m.index * bin_size + bin_size // 2, chrom_len - 1)
         summit = int(min(max(summit, start), end - 1))
         subs.append(
-            SubPeak(chrom=chrom, start=start, end=end, summit=summit,
-                    score=obs, neg_log10_p=nlp, fold_enrichment=fold,
+            SubPeak(chrom=chrom, start=int(start), end=int(end), summit=summit,
+                    score=float(obs[i]), neg_log10_p=float(nlp[i]),
+                    fold_enrichment=float(obs[i] / exp[i]),
                     persistence=m.persistence)
         )
     return subs
+
+
+def _gate_domain_subpeaks(peaks: NestedPeakSet, params: CallParams) -> None:
+    """Drop domain sub-peaks that are not outliers against the pooled null.
+
+    See ``CallParams.subpeak_domain_z``.  Operates in place, before FDR, on
+    the folds ``_call_subpeaks`` measured against each domain's own level.
+    """
+    if not (params.subpeak_vs_domain and params.subpeak_domain_z > 0):
+        return
+    doms = [r for r in peaks.regions if r.kind == "domain" and r.subpeaks]
+    folds = np.array([s.fold_enrichment for r in doms for s in r.subpeaks])
+    if folds.size < params.subpeak_domain_min_candidates:
+        return
+    lf = np.log(np.maximum(folds, 1e-9))
+    med = np.median(lf)
+    mad = 1.4826 * np.median(np.abs(lf - med))
+    cut = np.exp(med + params.subpeak_domain_z * max(mad, 1e-9))
+    for r in doms:
+        r.subpeaks = [s for s in r.subpeaks if s.fold_enrichment >= cut]
 
 
 def _apply_fdr(peaks: NestedPeakSet, params: CallParams) -> NestedPeakSet:
@@ -503,7 +671,15 @@ def _apply_fdr(peaks: NestedPeakSet, params: CallParams) -> NestedPeakSet:
         return peaks
 
     region_p = np.array([r.neg_log10_p for r in peaks.regions])
-    region_q = qvalue_from_neglog10p(region_p)
+    n_tests = None
+    if params.fdr_scope == "genome":
+        genome = sum(peaks.chrom_sizes.values())
+        width = float(np.median([r.end - r.start for r in peaks.regions]))
+        n_tests = genome / max(width, 1.0)
+    elif params.fdr_scope != "candidates":
+        raise ValueError(f"fdr_scope must be 'genome' or 'candidates', "
+                         f"got {params.fdr_scope!r}")
+    region_q = qvalue_from_neglog10p(region_p, n_tests=n_tests)
     for r, q in zip(peaks.regions, region_q):
         r.neg_log10_q = float(q)
 

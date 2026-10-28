@@ -39,6 +39,10 @@ def _add_input_args(p):
     p.add_argument("--bin-size", type=int, default=None,
                    help="bin size in bp (default: from preset, else 25)")
     p.add_argument("--mapq", type=int, default=30, help="minimum MAPQ for BAM input")
+    p.add_argument("--threads", type=int, default=0,
+                   help="worker processes for reading a BAM, one chromosome "
+                        "each (default 0: automatic -- up to 8 on a large file, "
+                        "serial on a small one)")
     p.add_argument("--blacklist", default=None,
                    help="BED of artefact regions to drop calls in (e.g. the "
                         "ENCODE mm10 exclusion list); .bed or .bed.gz")
@@ -137,6 +141,7 @@ def _load(args, path, bin_size, chroms):
     kw = {}
     if str(path).lower().endswith((".bam", ".cram", ".sam")):
         kw["mapq"] = args.mapq
+        kw["n_jobs"] = getattr(args, "threads", 0)
     return load_signal(path, bin_size=bin_size, chroms=chroms,
                        cache=not args.no_cache,
                        cache_dir=getattr(args, "cache_dir", None), **kw)

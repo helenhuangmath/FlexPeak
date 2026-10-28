@@ -79,6 +79,7 @@ def find_subpeaks(
     min_fold: float = 1.5,
     boundary_fraction: float = 0.5,
     offset: int = 0,
+    descent_level: int = 1,
 ) -> List[ScaleSpaceMaximum]:
     """Detect sub-peaks in one signal array.
 
@@ -93,6 +94,20 @@ def find_subpeaks(
         half-maximum watershed.
     offset : added to every returned index, so callers working on a slice get
         coordinates in the parent array.
+    descent_level : index into ``bandwidths`` of the smoothing the boundaries
+        are walked on.  The walk used to run on the finest level, which at
+        25 bp bins is the raw signal: a 600 bp focal peak inside a domain has
+        noise wiggles every few bins, the walk stopped at the first one, and
+        the peak came back as three or four ~150 bp fragments, each too small
+        to pass the FDR.  On the mixed benchmark that left 5 of 18 focal peaks
+        inside domains reported; walking the second level found all 18.  0
+        restores the old behaviour (ablation).
+
+    Each maximum climbs to the top of its hill at the walking level before
+    descending, and its summit is then re-read at full resolution inside the
+    footprint.  Maxima on the same hill therefore get the same footprint and
+    collapse into one sub-peak, and a noise maximum in a flank that climbs
+    onto a real peak cannot claim it under its own off-peak summit.
     """
     signal = np.asarray(signal, dtype=np.float64)
     n = signal.size
@@ -111,45 +126,65 @@ def find_subpeaks(
         maxima_per_scale.append(_local_maxima(sm, min_distance=min_dist))
 
     finest = maxima_per_scale[0]
+    level = int(np.clip(descent_level, 0, len(pyramid) - 1))
+    walk = pyramid[level]
     results: List[ScaleSpaceMaximum] = []
     claimed = np.zeros(n, dtype=bool)
 
-    for idx in finest:
-        # Persistence: how many coarser scales still show a maximum nearby.
-        persistence = 1
-        for level in range(1, len(pyramid)):
-            others = maxima_per_scale[level]
-            if others.size == 0:
-                continue
-            window = max(1, int(bandwidths[level] / bin_size))
-            if np.min(np.abs(others - idx)) <= window:
-                persistence += 1
+    # Persistence: how many coarser scales still show a maximum nearby.  Each
+    # level's maxima are sorted, so the nearest one to every finest maximum is
+    # a searchsorted neighbour.
+    persistence_all = np.ones(finest.size, dtype=int)
+    for level in range(1, len(pyramid)):
+        others = maxima_per_scale[level]
+        if others.size == 0 or finest.size == 0:
+            continue
+        window = max(1, int(bandwidths[level] / bin_size))
+        pos = np.searchsorted(others, finest)
+        left = others[np.clip(pos - 1, 0, others.size - 1)]
+        right = others[np.clip(pos, 0, others.size - 1)]
+        nearest = np.minimum(np.abs(finest - left), np.abs(finest - right))
+        persistence_all += nearest <= window
 
+    for idx, persistence in zip(finest, persistence_all.tolist()):
         if persistence < min_persistence:
             continue
         height = float(signal[idx])
         if height < min_fold * bg[idx]:
             continue
 
-        start, end = _descend(pyramid[0], bg, idx, boundary_fraction)
+        start, end = _descend(walk, bg, _climb(walk, int(idx)), boundary_fraction)
         # A summit whose whole footprint is already inside another sub-peak is
         # the same feature seen twice, not a second one.
         if claimed[start:end].all():
             continue
         claimed[start:end] = True
+        summit = start + int(np.argmax(pyramid[0][start:end]))
         results.append(
             ScaleSpaceMaximum(
-                index=idx + offset,
+                index=summit + offset,
                 start=start + offset,
                 end=end + offset,
-                height=height,
+                height=float(signal[summit]),
                 persistence=persistence,
-                scale_bp=int(bandwidths[0]),
+                scale_bp=int(bandwidths[level]),
             )
         )
 
     results.sort(key=lambda m: m.start)
     return results
+
+
+def _climb(smooth: np.ndarray, i: int) -> int:
+    """Walk uphill from ``i`` to the local maximum of ``smooth``."""
+    n = smooth.size
+    while True:
+        if i > 0 and smooth[i - 1] > smooth[i]:
+            i -= 1
+        elif i < n - 1 and smooth[i + 1] > smooth[i]:
+            i += 1
+        else:
+            return i
 
 
 def _descend(smooth: np.ndarray, bg: np.ndarray, peak: int,

@@ -193,21 +193,27 @@ def benjamini_hochberg(pvalues: np.ndarray) -> np.ndarray:
     return out
 
 
-def qvalue_from_neglog10p(neglog10p: np.ndarray) -> np.ndarray:
+def qvalue_from_neglog10p(neglog10p: np.ndarray,
+                          n_tests: Optional[float] = None) -> np.ndarray:
     """BH on the -log10 scale, staying in log space to avoid underflow.
 
     Very significant bins have p far below float64's smallest normal, so
     exponentiating first would collapse them all to zero and destroy the
     ordering that BH depends on.
+
+    ``n_tests`` is the number of hypotheses the values were selected from, when
+    that is more than were passed in (the untested ones are taken as null with
+    p = 1, which leaves every rank unchanged and only scales ``m``).
     """
     s = np.asarray(neglog10p, dtype=np.float64)
     n = s.size
     if n == 0:
         return s
+    m = max(float(n_tests), float(n)) if n_tests else float(n)
     order = np.argsort(-s)  # most significant first
     ranks = np.arange(1, n + 1)
-    # log10(q) = log10(p) + log10(n) - log10(rank)
-    logq = -s[order] + np.log10(n) - np.log10(ranks)
+    # log10(q) = log10(p) + log10(m) - log10(rank)
+    logq = -s[order] + np.log10(m) - np.log10(ranks)
     logq = np.minimum.accumulate(logq[::-1])[::-1]  # monotone in the same direction as BH
     # Deliberately no upper clip: the whole point of staying in log space is to
     # keep the ordering of hits whose p-values are below float64's smallest

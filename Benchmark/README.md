@@ -22,32 +22,33 @@ Base-pair F1 against known truth, all methods at their own nominal FDR 5%:
 
 | Method | narrow | broad | mixed | low quality |
 |---|---:|---:|---:|---:|
-| **FlexPeak (defaults)** | 91% | **99%** | **99%** | 58% |
-| FlexPeak (self-tuned) | 91% | **99%** | 7% | 8% |
-| FlexPeak (preset h3k27me3) | 56% | 95% | 97% | 64% |
+| **FlexPeak (defaults)** | **93%** | **99%** | **99%** | **96%** |
+| FlexPeak (self-tuned) | **93%** | **99%** | **99%** | **96%** |
+| FlexPeak (preset h3k27me3) | 84% | 95% | 93% | 67% |
 | MACS2 / MACS3 narrow | 90% | 52% | 55% | 15% |
 | MACS2 / MACS3 broad | 80% | 94% | 94% | 44% |
 | SICER/epic2-style, defaults | 11% | 94% | 95% | 54% |
 | SICER/epic2-style, tuned | 17% | 97% | 97% | 63% |
 | DESeq2/csaw-style, 200 bp | 61% | 0% | 8% | 0% |
 | DESeq2/csaw-style, 5 kb | 21% | 98% | 92% | 56% |
-| FlexPeak, Poisson background (ablation) | 69% | 96% | 91% | 52% |
+| FlexPeak, Poisson background (ablation) | 82% | 99% | 98% | 66% |
 
-Four results matter, and two of them are unfavourable to FlexPeak:
+Four results matter:
 
 1. **FlexPeak handles all three scales with one parameter set.** Every other
    method has a configuration that is good on narrow *or* broad and bad on the
    other. This is the design claim, and on this data it holds.
 2. **FlexPeak's boundaries are an order of magnitude tighter** on broad
-   domains: median |Δstart| 312 bp, against 18,944 bp for MACS broad, 1,112 bp
+   domains: median |Δstart| 338 bp, against 18,944 bp for MACS broad, 1,112 bp
    for the tuned SICER-style baseline and 1,075 bp for 5 kb NB windows.
-3. **The self-tuner is actively harmful on two of four datasets** — F1 collapses
-   from 99% to 7% on mixed and from 58% to 8% on low-quality data (§5.1). Plain
-   defaults are far better. This is a defect, not a caveat.
-4. **FlexPeak is not the best method on low-quality data.** The tuned
-   SICER-style baseline (63%) and 1 kb windows (66%) beat FlexPeak's defaults
-   (58%), which is the dataset FlexPeak's stated motivation targets most
-   directly.
+3. **The self-tuner no longer degrades anything.** Its previous version
+   collapsed to F1 7% on mixed and 8% on low-quality data; after the objective
+   was made two-sided (§5.1) it reproduces the defaults on every dataset. It
+   still does not *improve* on them here, and §5.1 records where it cannot.
+4. **Low-quality data is now FlexPeak's clearest win over the baselines:**
+   F1 96% against 44% (MACS broad), 63% (tuned SICER-style) and 66% (1 kb
+   windows). The change was a single default — the 1.5× fold floor that had
+   been erasing every 1.6× domain (§5.4).
 
 ![F1 heatmap](figures/B1_f1_heatmap.png)
 
@@ -139,37 +140,42 @@ meaningful together — a method can score well on one by failing at the other.
 
 ## 5. Findings
 
-### 5.1 The self-tuner degrades results on hard data — a real defect
+### 5.1 The self-tuner: fixed, and where it still falls short
 
-| Dataset | Defaults F1 | Self-tuned F1 | Self-tuned territory |
+| Dataset | Defaults F1 | Self-tuned F1 | Self-tuned F1, previous objective |
 |---|---:|---:|---:|
-| narrow | 91% | 91% | 1.2% |
-| broad | 99% | 99% | 16.0% |
-| **mixed** | **99%** | **7%** | 0.7% (vs 19.3%) |
-| **low quality** | **58%** | **8%** | 0.5% (vs 4.2%) |
+| narrow | 93% | 93% | 91% |
+| broad | 99% | 99% | 99% |
+| mixed | 99% | 99% | **7%** |
+| low quality | 96% | 96% | **8%** |
 
-On mixed and low-quality data the tuner selects a setting whose base-pair recall
-is 4%, with precision still high. It is not over-merging — it is collapsing to
-an extremely conservative corner, keeping only the strongest focal peaks and
-discarding essentially all domain territory.
+The previous objective was `mean(stability, reproducibility) − territory
+penalty`, with stability the Jaccard between full-depth calls and calls on a
+50% thinning. That is one-sided: the penalty stops over-merging, but nothing
+stops the symmetric failure of calling almost nothing, and a strict setting
+that keeps only the strongest focal peaks is perfectly stable. On mixed data the
+tuner duly chose F1 7% while scoring that setting's stability at 0.98.
 
-The mechanism is visible in the objective (DESIGN.md §3.4). It is
+The objective is now anchored by a **held-out fit** term (DESIGN.md §3.4,
+`flexpeak.tune.objective`): the reads are split into two halves, calls are
+made on one, each called piece's fold is read off that half, and the score is
+how much better that piecewise enrichment explains the *other* half's reads
+than background alone (a Poisson log-likelihood ratio on data the caller never
+saw). Missing a domain forfeits its evidence; calling noise costs, because the
+other half does not reproduce it; narrow and broad compete in the same units.
+Stability is now measured between the two halves rather than against a
+thinning, which removes the bias toward conservative settings.
 
-```
-objective = mean(stability, reproducibility) - territory_penalty
-```
-
-Stability is the Jaccard between full-depth and subsampled calls. A very strict
-setting produces few, strong, perfectly reproducible calls, so stability
-approaches 1. The territory penalty only engages *above* a genome-fraction cap,
-so it does nothing to punish under-calling. **The objective is one-sided:** the
-design correctly identified that stability is maximised by over-merging and
-added a penalty for it, but nothing counterbalances the symmetric degenerate
-solution of calling almost nothing.
-
-This is a design problem in the objective, not a tuning-grid problem, and it is
-why `--no-tune` currently outperforms the tuner on exactly the data the tuner
-exists to help with.
+**Where it still falls short.** On a smaller, shallower version of the
+low-quality dataset (2.25 Mb, in `tests/test_tune_and_calls.py`) the
+autocorrelation-length estimate collapses to one bin, the defaults segment at
+the 100 bp floor and recover F1 0.78, and a 500 bp segmentation would give
+0.91 — but the tuner cannot tell the two apart from half-depth data and keeps
+the default. The objective is no longer harmful; it is not yet sharp enough to
+pick the segmentation scale on weak data. Giving the grid an absolute
+segmentation-bin axis was measured and rejected: it rescues this case only in
+some configurations and costs TF-like data 5–15 F1 points, because the
+held-out term barely penalises boundary bloat.
 
 ### 5.2 MACS in narrow mode fragments broad domains, as documented
 
@@ -186,13 +192,12 @@ is for.
 
 | Method | calls | genome called |
 |---|---:|---:|
+| FlexPeak (defaults / self-tuned) | 2 | 0.02% |
 | MACS2/3 narrow | 18 | 0.03% |
-| FlexPeak (defaults) | 10 | 0.07% |
 | MACS2/3 broad | 121 | 0.40% |
-| FlexPeak (self-tuned) | 94 | 0.54% |
-| **FlexPeak, Poisson ablation** | 827 | **2.58%** |
-| FlexPeak (preset h3k27me3) | 288 | 7.34% |
-| SICER-style (re-impl.) | 286–745 | 24–32% |
+| **FlexPeak, Poisson ablation** | 24 | **0.55%** |
+| FlexPeak (preset h3k27me3) | 5 | 3.54% |
+| SICER-style (re-impl.) | 85–745 | 24–32% |
 | DESeq2/csaw-style (re-impl.) | 0 | 0.00% |
 
 The correct answer is zero. Two things to read carefully here:
@@ -200,23 +205,42 @@ The correct answer is zero. Two things to read carefully here:
 - **The simulator draws background from the negative binomial family FlexPeak
   assumes**, so FlexPeak is favoured by construction. The comparison that does
   *not* depend on that assumption is FlexPeak against its own Poisson ablation:
-  identical code, one distribution swapped, 0.07% → 2.58%. That is a controlled
-  37-fold difference and it is the strongest support here for the NB claim.
+  identical code, one distribution swapped, 0.02% → 0.55%. That is a controlled
+  ~25-fold difference and it is the strongest support here for the NB claim.
+  (Both figures fell with the FDR change below; the ratio did not.)
+- Region-level FDR is now taken over the number of candidate-sized tiles in
+  the genome rather than over the handful of candidates the HMM returned
+  (`CallParams.fdr_scope`). The HMM scanned the whole genome to produce them,
+  so correcting over the candidates alone was selection without paying for
+  it; with the fold floor lowered to 1.2 that let 16 noise regions through
+  here, versus 2 now.
 - **The SICER-style figure should not be attributed to SICER2 or epic2** (§2).
   A Poisson island test on overdispersed background is genuinely
   anti-conservative, but the published tools apply a null-derived score
   threshold this re-implementation lacks.
-- `--preset h3k27me3` calls 7.34% of a null genome, worse than the Poisson
+- `--preset h3k27me3` calls 3.54% of a null genome, worse than the Poisson
   ablation. This corroborates the main README's statement that the presets are
   uncalibrated placeholders and should not be used.
 
-### 5.4 Where FlexPeak loses
+### 5.4 Where FlexPeak loses, and the one default that was losing it
 
-- **Low-quality data**: F1 58% for FlexPeak defaults against 66% for the 1 kb
-  SICER-style baseline and 63% for the tuned one. This is the scenario
-  FlexPeak's motivation targets most directly, and it does not win it.
-- **Narrow precision**: 86% for FlexPeak against 95% for MACS narrow at
-  comparable territory. MACS is the more precise focal caller here.
+- **Low-quality data** was FlexPeak's weakest result (F1 58%, behind two
+  baselines). The cause was not the model: the 1.6× domains measure ~1.35×
+  against a local background that is a *maximum* over windows and so sits a
+  little above the true level, and the region fold floor was 1.5, so every one
+  of them was discarded after being correctly segmented. Lowering the floor to
+  1.2 (significance, not the floor, is what keeps noise out) takes it to 96%
+  with nothing else changed. The floor had been hiding exactly the marks the
+  tool exists for.
+- **Narrow precision**: 94% for FlexPeak against 95% for MACS narrow at
+  comparable territory; MACS remains marginally the more precise focal caller.
+- **Sub-peaks inside domains** are not scored by this benchmark's interval
+  metrics, but were measured separately: with the boundary descent moved from
+  the raw signal to the first smoothing level, all 18 simulated focal peaks
+  inside mixed domains are reported (previously 5), and judging domain
+  sub-peaks against the domain's own level with a pooled robust-z outlier
+  gate leaves the flat low-quality domains with none (previously ~150 noise
+  bumps). See `CallParams.subpeak_vs_domain`.
 - **Broad domains, 5 kb NB windows**: F1 98% against FlexPeak's 99% — a
   windowed NB test with a well-chosen window size is nearly as good on pure
   broad data, and far simpler. FlexPeak's advantage over it appears on `mixed`
@@ -226,23 +250,27 @@ The correct answer is zero. Two things to read carefully here:
 
 End to end, with BAM parsing charged to both:
 
-| Method | median wall clock |
-|---|---:|
-| FlexPeak (defaults) | 12.6 s |
-| MACS2 narrow / broad | 6.8 / 6.7 s |
-| MACS3 narrow / broad | 7.3 / 7.2 s |
-| FlexPeak (self-tuned) | 53.2 s |
+| Method | median wall clock | previously |
+|---|---:|---:|
+| FlexPeak (defaults) | 2.9 s | 12.6 s |
+| MACS2 narrow / broad | 7.5 / 7.5 s | 6.8 / 6.7 s |
+| MACS3 narrow / broad | 8.1 / 7.8 s | 7.3 / 7.2 s |
+| FlexPeak (self-tuned) | 7.6 s | 53.2 s |
 
-FlexPeak is **~1.8× slower than MACS2** on this genome, against the ≤1.5×
-target in [DESIGN.md §7](../docs/DESIGN.md). The self-tuner costs a further
-30–55 s. Most of FlexPeak's time is the pysam read loop, not the HMM: the
-Poisson ablation, which skips nothing but the NB dispersion fit and runs on
-coverage already in memory, takes 2.0 s.
+FlexPeak is now **~2.6× faster than MACS2** end to end on this genome, and the
+self-tuner (27 grid points, two read halves each) costs about 5 s on top. The
+changes were: the BAM is scanned once into fragment-anchor arrays and binned
+with `bincount` instead of a per-read Python loop with a second full pass for
+the fragment-length estimate (load 11.7 s → 2.7 s for the pair); the HMM's
+gamma-function coefficient is computed once per chromosome instead of per
+state per EM iteration; sub-peak candidates are tested in one vectorised
+call; and the tuner fits the background and the HMM once per read half and
+re-thresholds them at every grid point. Per-chromosome multiprocessing exists
+in the loader (`load_bam(n_jobs=...)`, `--threads`) but is off at this size,
+where worker start-up costs more than the scan.
 
-Two reasons not to read much into this: a 4.5 Mb genome is far below the scale
-where the per-chromosome parallelism in DESIGN.md §7 would matter (and it is
-not implemented), and the re-implemented baselines are excluded from this
-comparison entirely because they never touch a BAM.
+The re-implemented baselines are excluded from this comparison because they
+never touch a BAM.
 
 ## 6. Threats to validity
 
@@ -255,6 +283,12 @@ comparison entirely because they never touch a BAM.
 4. **One replicate per condition.** No seed variation, so none of these numbers
    carry an uncertainty estimate. Differences under a few percent are not
    interpretable.
+7. **Three defaults were changed after seeing this benchmark** (the region
+   fold floor, the segmentation-bin floor and the sub-peak gate), each
+   measured on these same five datasets plus smaller simulations in the test
+   suite. They are principled and documented in `CallParams`, but they were
+   chosen with these results in view; the held-out numbers that would show
+   they generalise are the experimental data in `testing/`, not this table.
 5. **A 4.5 Mb genome** is three orders of magnitude smaller than a real one. The
    runtime figure is a smoke test; it says nothing about scaling.
 6. **The evaluation code is part of the FlexPeak repository.** It was written
