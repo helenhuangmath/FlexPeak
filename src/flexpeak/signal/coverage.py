@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
@@ -157,6 +157,29 @@ class Coverage:
             source=f"{self.source}#thin{fraction}s{seed}",
             is_count=self.is_count,
             n_fragments=int(self.n_fragments * fraction) if self.n_fragments else None,
+            fragment_length=self.fragment_length,
+            meta=dict(self.meta),
+        )
+
+    def split(self, seed: int = 0) -> Tuple["Coverage", "Coverage"]:
+        """Two disjoint halves of the reads: ``(A, B)`` with ``A + B == self``.
+
+        Each count is split binomially at 1/2, so for Poisson read sampling the
+        halves are independent draws of the same underlying signal.  That is
+        what lets one half validate calls made on the other (see
+        ``tune.objective``) -- unlike two thinned copies, which share reads.
+        """
+        a = self.thin(0.5, seed=seed)
+        b = {c: (np.rint(np.maximum(self.bins[c], 0)) - a.bins[c]).astype(np.float32)
+             for c in self.bins}
+        half = int(self.n_fragments * 0.5) if self.n_fragments else None
+        return a, Coverage(
+            bins=b,
+            bin_size=self.bin_size,
+            chrom_sizes=dict(self.chrom_sizes),
+            source=f"{self.source}#split{seed}b",
+            is_count=self.is_count,
+            n_fragments=half,
             fragment_length=self.fragment_length,
             meta=dict(self.meta),
         )

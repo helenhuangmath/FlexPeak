@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import numpy as np
-from scipy import stats
+from scipy.special import gammaln, xlog1py
 
 from ._kernels import forward_backward, viterbi
 
@@ -143,18 +143,29 @@ class NBHMM:
 
     def _log_emissions(self, counts: np.ndarray, mu: np.ndarray, alpha: np.ndarray,
                        multipliers: np.ndarray,
-                       disp_scale: Optional[np.ndarray] = None) -> np.ndarray:
-        """(n_states, n_bins) log NB pmf."""
+                       disp_scale: Optional[np.ndarray] = None,
+                       cache: Optional[dict] = None) -> np.ndarray:
+        """(n_states, n_bins) log NB pmf.
+
+        The same expression as ``scipy.stats.nbinom.logpmf``, split so the
+        gamma-function coefficient -- which depends on the counts and the
+        dispersion but not on the state multiplier -- is computed once per
+        dispersion and reused across states and EM iterations via ``cache``.
+        That coefficient was half the cost of a whole ``call_peaks``.
+        """
         k = np.maximum(np.round(counts), 0)
+        cache = {} if cache is None else cache
         out = np.empty((multipliers.size, counts.size), dtype=np.float64)
         for s, m in enumerate(multipliers):
             mu_s = np.maximum(mu * m, 1e-9)
             scale = 1.0 if disp_scale is None else float(disp_scale[s])
-            a = np.maximum(alpha * scale, 1e-10)
-            n = 1.0 / a
+            if scale not in cache:
+                n = 1.0 / np.maximum(alpha * scale, 1e-10)
+                cache[scale] = (n, gammaln(n + k) - gammaln(k + 1) - gammaln(n))
+            n, coeff = cache[scale]
             p = np.clip(n / (n + mu_s), 1e-12, 1.0)
             with np.errstate(divide="ignore", invalid="ignore"):
-                out[s] = stats.nbinom.logpmf(k, n, p)
+                out[s] = coeff + n * np.log(p) + xlog1py(k, -p)
         return np.nan_to_num(out, nan=-745.0, neginf=-745.0)
 
     @staticmethod
@@ -214,8 +225,9 @@ class NBHMM:
         it = 0
 
         disp = np.ones(self.n_states)
+        cache: dict = {}
         for it in range(1, self.max_iter + 1):
-            log_e = self._log_emissions(counts, mu, alpha, mult, disp)
+            log_e = self._log_emissions(counts, mu, alpha, mult, disp, cache)
             gamma, xi_sum, ll = self._forward_backward(log_e, A, pi)
 
             # M-step.  Closed-form weighted method-of-moments for the state
@@ -256,7 +268,7 @@ class NBHMM:
                 break
             prev_ll = ll
 
-        log_e = self._log_emissions(counts, mu, alpha, mult, disp)
+        log_e = self._log_emissions(counts, mu, alpha, mult, disp, cache)
         gamma, _, _ = self._forward_backward(log_e, A, pi)
         path = self._viterbi(log_e, A, pi)
         posterior = 1.0 - gamma[0]

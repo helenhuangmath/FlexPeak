@@ -2,7 +2,7 @@
 
 Flexible, adaptive peak calling for ChIP-seq / CUT&RUN / CUT&Tag / ATAC-seq.
 
-Status: design draft, v0. Nothing implemented yet.
+Status: v0.1 — §3, §7 and §8 are implemented and measured; §5 (QC) is partial; §6 (annotation) is not started. Sections written as plans before implementation have been revised to record what was built and what was measured; where a measurement overturned the plan, the plan is kept and the correction follows it, so the reasoning survives. The simulated-data comparison that produced the numbers quoted here is `Benchmark/README.md`; experimental-data validation (§9–10) is still ahead.
 
 **Scope decision (recorded):** FlexPeak has **no pretrained model, no training corpus, and no ML dependency** on any path. Adaptivity comes from per-sample self-tuning at runtime (§8). See §13 for what was considered and dropped, and why.
 
@@ -54,9 +54,10 @@ Design principle: **an auditable statistical caller end to end.** Every call car
 
 ### 3.1 Signal representation
 
-- Read/fragment coverage binned at adaptive resolution (default 25 bp; 10 bp for TF/ATAC, 200 bp for broad marks — chosen by the tuner).
+- Read/fragment coverage binned at a *reporting* resolution (default 25 bp; 10 bp for TF/ATAC presets, 100 bp for broad-mark presets). The HMM segments at a coarser, data-derived scale (§3.3c) and the posterior is mapped back, so the reporting bin is a resolution choice, not a sensitivity choice.
 - Paired-end: use actual fragments. Single-end: estimate fragment length by strand cross-correlation, extend.
-- Store as per-chromosome `int32`/`float32` numpy arrays. Cache to disk (npz/zarr) so re-runs skip BAM parsing entirely. This is what makes the §8 sweep affordable.
+- The BAM is scanned **once** per chromosome into integer arrays of fragment anchors (forward starts / reverse ends, or fragment starts / ends for pairs); fragment-length estimation, extension and binning are then NumPy operations (`bincount` on a difference array). The per-read Python loop reads four fields and appends an integer, which is the floor pysam allows. Chromosomes are independent and scanned in worker processes on large files (`--threads`).
+- Store as per-chromosome `float32` numpy arrays. Cache to disk (npz) so re-runs skip BAM parsing entirely. This is what makes the §8 sweep affordable.
 
 ### 3.2 Background model — negative binomial GLM with covariates
 
@@ -79,7 +80,13 @@ Two coupled layers, one pass:
 
 **Layer 1 — domain segmentation (coarse).** NB-HMM over coarse bins, states `{background, weak-enriched, strong-enriched}`. Forward–backward gives per-bin posterior enrichment; Viterbi gives boundaries. Boundaries are *inferred*, not set by a `--gap-size` guess — which is precisely why SICER over-merges.
 
-**Layer 2 — sub-peak detection (fine).** Scale-space / à trous wavelet decomposition of the fine-binned signal. Smooth at a bandwidth ladder (50, 150, 500, 1500, 5000 bp), find local maxima at each scale, link maxima across scales into a scale-space tree. A feature persisting across many scales is real structure; one appearing at a single scale is noise. Standard practice in astronomical source detection, and the right tool for "sharp and broad in the same track."
+**Layer 2 — sub-peak detection (fine).** Scale-space decomposition of the fine-binned signal. Smooth at a bandwidth ladder (50, 150, 500, 1500, 5000 bp), find local maxima at each scale, link maxima across scales. A feature persisting across many scales is real structure; one appearing at a single scale is noise. Standard practice in astronomical source detection, and the right tool for "sharp and broad in the same track."
+
+Three details were settled by measurement (`Benchmark/`, simulated H3K9me3-like domains with three focal peaks each):
+
+- **Boundaries are walked on the first smoothing level, not the raw signal** (`subpeak_descent_level`). At 25 bp the raw signal has a noise wiggle every few bins; the half-maximum walk stopped at the first one and a 600 bp focal peak came back as three or four ~150 bp fragments, each too small to pass the FDR. 5 of 18 focal peaks inside domains were reported; walking the 150 bp level finds all 18. Each maximum first climbs to the top of its hill at that level, so maxima on one hill collapse into one sub-peak, and the summit is then re-read at full resolution inside the footprint.
+- **Inside a domain, a sub-peak is judged against the domain's own level, not genome background** (`subpeak_vs_domain`). A sub-peak nested in a domain claims focal structure *on top of* the domain. Against genome background every bump on a 2.5× plateau is "enriched"; the 1.6× low-quality domains, which contain no focal structure at all, carried ~150 reported sub-peaks. The domain level is the median 1 kb-smoothed fold inside the region; both the fold floor and the NB test use `mu` scaled by it. This conditional test runs *without* the genome-wide autocorrelation inflation — that factor is estimated at domain scale and conditioning on the domain level is what removes it; applied anyway it is ~14× on the mixed benchmark and buries true focal peaks at −log10 p ≈ 2.
+- **Candidates are local maxima, so their p-values are not uniform under the null**, and BH on them passed a third of the noise bumps. But a sample supplies its own null: nearly every candidate maximum in a domain is noise, so the median and MAD of log fold-over-domain, pooled over all domains in the sample, measure that noise directly, and a real focal peak must be an outlier against it (`subpeak_domain_z`, 4σ). Measured: every true focal peak scored z ≥ 5.1, none of ~2,400 noise candidates exceeded 3.8. Pooling is what lets a 3 kb domain with four candidates be judged at all. A noisier library widens its own null. The flat low-quality domains now carry zero sub-peaks; the 18 true ones stay.
 
 **Merge.** Sub-peaks are assigned to their containing domain:
 
@@ -91,16 +98,26 @@ domain_00123   chr1  1,200,000  1,460,000  q=1e-31  width=260kb  n_subpeaks=4
 
 Emit `narrowPeak` (sub-peaks), `broadPeak`/`gappedPeak` (domains), plus a native nested format (BED12 or Parquet) preserving the parent/child link. Isolated sub-peaks with no enclosing domain are ordinary narrow peaks. **Nothing requires the user to declare "narrow" or "broad" up front** — that is the whole point.
 
+### 3.3d Region-level decisions — the fold floor and the FDR scope
+
+Two defaults decided the low-quality result, and both were wrong before being measured.
+
+**The region fold floor was 1.5 and is now 1.2.** The local background is a *maximum* over window scales (§3.2), so it sits a little above the true level, and a 1.6× domain measures ~1.35× against it. With a 1.5 floor every one of those domains was correctly segmented by the HMM and then discarded; base-pair F1 on the low-quality benchmark was 13% at 1.5 and 96% at 1.2 with nothing else changed. The floor had been hiding exactly the marks the tool exists for. Significance, not the floor, is what keeps noise out — which is why the FDR had to change with it.
+
+**Region FDR is taken over the genome, not over the candidates** (`fdr_scope="genome"`). The HMM scanned the whole genome before handing over a few dozen candidates; correcting over those alone is selection without paying for it. The number of tests is taken as the number of candidate-sized tiles that fit in the genome (genome size / median candidate width); the untested tiles count as null with p = 1, which leaves every rank unchanged and only scales *m*. On the null benchmark the 1.2 floor alone let 16 noise regions through; with the genome-wide count it is 2, below the 3 the old floor allowed.
+
+**The automatic segmentation bin is floored at 100 bp** (`min_segment_bin_bp`). On a weak or overdispersed library the autocorrelation estimate (§3.3c) collapses to one bin — sparsity decorrelates a signal that is really continuous — and the HMM then decides a state per 25 bp bin, which no sparse bin can support: a 1.6× domain came back as ~50 fragments and pure noise grew a "weak" state at 1.7×. Four bins is the smallest unit that carries a decision. Measured: free on every full-size benchmark set (mixed +0.7 F1), 6× fewer false calls on a small null genome, shredded weak domains F1 0.50 → 0.78; 200 bp already costs TF-scale peaks (0.93 → 0.88).
+
 ### 3.4 The tuning objective — making "looks right in IGV" explicit
 
 Automating parameter selection is not a search problem (grid search is trivial); it is an *objective* problem. Expert tuning by browser inspection optimizes something real but unstated: peaks land where signal visibly is, boundaries hug the enrichment, no fragmentation, no fusion. Automation requires naming that. Four objective terms, none requiring manual inspection:
 
-1. **Replicate reproducibility.** How many peaks are reproducible across true replicates (IDR, or overlap consistency). The closest automatic proxy to visual correctness: fragmenting a domain and calling noise both reproduce poorly.
-2. **Subsampling stability.** Calls surviving a 50% read subsample are not fitting noise.
-3. **Motif central enrichment (TF mode).** A real CTCF peak carries the motif near its summit. A precision signal requiring no reference peak set. **Use CTCF as the calibration anchor for the whole project.**
-4. **FRiP + signal partition,** constrained by per-mark width and count priors.
+1. **Held-out fit (implemented, carries most of the weight).** Split the reads at random into two halves. Call on one half; read each called piece's fold off that half; score how much better that piecewise-constant enrichment explains the *other* half's reads than background alone does (a Poisson log-likelihood ratio on data the caller never saw). This term is two-sided by construction: missing real enrichment forfeits its evidence, calling noise costs (the other half does not reproduce it), over-merging dilutes the fold over background bins which then pay the same penalty. Narrow and broad compete in the same units — evidence — so neither scale can be sacrificed for the other unnoticed.
+2. **Split stability.** Calls on the two read halves agree (Jaccard). Replaces the earlier *subsampling* stability (full depth vs a 50% thinning), which was biased toward conservative settings: the thinned copy always loses the weakest calls, so the fewer weak calls a setting makes, the better it agrees with itself. On the simulated mixed benchmark that bias was decisive — the tuner chose a setting with F1 7% while scoring its stability at 0.98.
+3. **Replicate reproducibility**, when true replicates are supplied.
+4. **Motif central enrichment (TF mode)** and **FRiP + signal partition** — planned, not implemented.
 
-Terms 1 and 2 are **maximized by over-merging** — one giant peak per chromosome is perfectly stable and perfectly reproducible. A **territory/width penalty is therefore mandatory**, and at least one ungameable orthogonal term (3 or 4) must carry weight. See §12.
+Terms 2 and 3 are **maximized by over-merging** — one giant peak per chromosome is perfectly stable and perfectly reproducible — and term 1 alone would also accept a single giant region if the territory it swallows were nearly free. A **territory/width penalty is therefore mandatory** and the objective refuses to be constructed without one. See §12.
 
 Select the **plateau of the objective curve, not the argmax** — argmax overfits the metric exactly as eyeballing overfits one locus.
 
@@ -119,35 +136,38 @@ Monotone in mark breadth across every parameter. **Validation question: does the
 
 ## 4. Package architecture
 
+As built (`src/flexpeak/`):
+
 ```
 flexpeak/
-├── io/            bam.py (pysam), bigwig.py (pyBigWig), bed.py, cache.py
-├── signal/        coverage.py, fragment.py, normalize.py, scalespace.py
-├── background/    nbglm.py, dispersion.py, covariates.py (mappability/GC/CN)
-├── segment/       hmm.py, subpeak.py, merge.py, nested.py
-├── stats/         nbtest.py, fdr.py, idr.py
-├── tune/          objective.py, sweep.py, subsample.py, presets.py
-├── qc/            metrics.py, report.py
-├── plots/         style.py (Arial, vector PDF), stats.py (per-run statistics figures)
-├── annotate/      genes.py, features.py, motifs.py, repeats.py
-├── bench/         harness.py, truth.py, metrics.py, competitors.py
-├── cli.py
-└── data/          blacklists, chrom sizes, mark presets
+├── io/            bam.py (one-pass scan, fragment anchors, process pool), bigwig.py, load.py (format dispatch + npz cache)
+├── signal/        coverage.py   — Coverage: the single in-memory representation; rebin / thin / split / subset
+├── background/    nb.py         — local-lambda background with signal exclusion, NB dispersion trend, covariates
+├── segment/       hmm.py (NB-HMM, dwell floor), _kernels.py (numba forward/backward/Viterbi), subpeak.py (scale space)
+├── stats/         nbtest.py     — NB tails, aggregate dispersion, autocorrelation, BH in log space
+├── tune/          objective.py (held-out fit, stability, territory), sweep.py (grid, read halves, plateau)
+├── qc/            metrics.py
+├── plots/         style.py, stats.py
+├── caller.py      CallParams (every default documented with its measurement), call_peaks
+├── peaks.py       NestedPeakSet / Region / SubPeak and the four output formats
+├── simulate.py    synthetic data with exact truth — the test suite's and the benchmark's substrate
+└── cli.py         callpeak | tune | qc | stats
 ```
+
+Not built: `annotate/` (§6), the HTML report (§5), `data/` (bundled blacklists and chrom sizes). Interval operations are a few hundred lines in `peaks.py` rather than a dependency; the planned pyranges/bioframe dependency was not needed for what the caller does.
 
 **CLI** — deliberately MACS2-shaped so people can switch in one line:
 
 ```bash
-flexpeak callpeak -t chip.bam -c input.bam -g hs -n H3K9me3_sample   # self-tunes, nested output
-flexpeak callpeak -t sig.bw --mark H3K27me3                          # bigWig input
-flexpeak tune     -t chip.bam --chroms chr1,chr19 --report           # inspect the objective curve
-flexpeak qc       -t chip.bam -p peaks.nested.bed -o qc.html
-flexpeak stats    -p peaks.nested.tsv --outdir figures              # width/count/enrichment figures, PDF
-flexpeak annotate -p peaks.nested.bed --gtf gencode.v44.gtf
-flexpeak callpeak ... --preset h3k27me3 --no-tune                    # skip the sweep, use a preset
+flexpeak callpeak -t chip.bam -c input.bam -n H3K9me3_sample          # self-tunes, nested output
+flexpeak callpeak -t sig.bw --preset h3k27me3 --no-tune -n K27        # bigWig input, preset, bit-identical reruns
+flexpeak callpeak -t chip.bam --threads 8 --blacklist mm10.bed.gz     # parallel BAM scan, exclusion list
+flexpeak tune     -t chip.bam --chroms chr1,chr19                     # inspect the objective curve
+flexpeak qc       -t chip.bam -p peaks.nested.tsv
+flexpeak stats    -p peaks.nested.tsv --outdir figures                # width/count/enrichment figures, PDF
 ```
 
-**Dependencies:** numpy, scipy, pysam, pyBigWig, pandas, **pyranges** or **bioframe** (interval ops — do not write your own), numba (hot loops), jinja2 + plotly (report). No scikit-learn, no LightGBM, no torch. Install is `pip install flexpeak`, full stop — no model download, no cache dir, no checksums, no version pinning of weights.
+**Dependencies:** numpy and scipy only, at the core. Optional extras: pysam (BAM/CRAM), pyBigWig (bigWig), numba (HMM kernels; a NumPy fallback is tested to agree), matplotlib (figures). No scikit-learn, no LightGBM, no torch. Install is `pip install flexpeak`, full stop — no model download, no checksums, no version pinning of weights.
 
 ---
 
@@ -268,12 +288,14 @@ Nearest gene/TSS with distance and strand; genomic feature distribution (promote
 
 Target: within 1.5× of MACS2 wall-clock on the same BAM, using more cores.
 
-1. **Bin, don't iterate per-bp.** Base-pair resolution only inside candidate regions for summit refinement. Biggest single win.
-2. **Per-chromosome multiprocessing** — embarrassingly parallel; MACS2 is single-threaded. This is where you actually beat it.
-3. **Numba** for HMM forward–backward and region linking. Rust/pyo3 only if profiling demands it — the maintenance cost is real.
-4. **Cache the binned coverage.** Re-runs and every sweep point skip BAM I/O entirely.
-5. **Stratified chromosome subset for tuning:** one large gene-dense (chr1), one gene-poor (chr4/chr18), one small (chr19). One chromosome is not representative for broad marks and chr1 alone biases gene-dense. Exclude chrY/chrM. Auto-escalate when estimates disagree across the subset, and say so in the report.
-6. Accept CRAM; support bigWig input to skip alignment parsing entirely.
+**Measured** (`Benchmark/`, 4.5 Mb synthetic genome, BAM parse charged to both, single-threaded): FlexPeak 2.9 s against MACS2 7.5 s and MACS3 8.1 s — **2.6× faster**, down from 1.8× slower before the work below; the self-tuning sweep (27 grid points, two read halves) adds ~5 s. Where the time went, in order of what was fixed:
+
+1. **One pass over the BAM, no per-read Python.** The loader scanned every read in a Python loop and then made a *second* full pass for the fragment-length estimate, indexing a NumPy array once per read. Both passes are now one scan into integer anchor arrays, and everything downstream is `bincount`. Load time for a treatment/control pair: 11.7 s → 2.7 s, coverage bit-identical.
+2. **The HMM emission's gamma-function coefficient** depends on counts and dispersion but not on the state multiplier; it was recomputed per state per EM iteration and was half the cost of a whole call. Computed once per chromosome now.
+3. **Sub-peak candidates are tested in one vectorised NB call** from prefix sums; a large domain can hold thousands and testing them one by one was ~90% of a call on mixed data.
+4. **The tuner reuses what the grid does not change**: the background is fitted once per read half, and the HMM once per half per segmentation setting — the posterior cutoff and fold floor only threshold its output. 53 s → 7.6 s.
+5. **Per-chromosome multiprocessing** exists in the loader (`load_bam(n_jobs=)`, `--threads`) and is automatic above 10 M reads; below that the worker start-up costs more than the scan. Under the `spawn` start method (macOS, Windows) it is opt-in for library callers, because a script without a `__main__` guard would re-run itself in every worker.
+6. **Bin, don't iterate per-bp;** **numba** for forward–backward and Viterbi, with a NumPy fallback tested to agree; **cache the binned coverage** so re-runs skip BAM I/O; **stratified chromosome subset** for tuning (one large, one mid, one small); CRAM and bigWig input.
 
 ---
 
@@ -283,15 +305,19 @@ The tuner learns from the sample in front of it. This removes the largest cost, 
 
 ### 8.1 The insight
 
-Depth-subsampling simulation does not require a public corpus. It requires *a library deeper than the one being called on* — and every sample is deeper than a subsample of itself.
+A sample can validate itself. Split its reads at random into two halves: each half is an independent draw of the same underlying signal, so calls made on one half can be tested against reads the caller never saw.
 
-1. Load the treatment BAM, build binned coverage on the stratified chromosome subset (§7.5), cache it.
-2. Create degraded copies at 50% and 25% depth, two seeds each — resample the cached fragment set, no re-parsing.
-3. Sweep the parameter grid (~100 points). For each setting, call on full depth and on the degraded copies.
-4. Score with the §3.4 objective.
-5. Take the plateau. Report the choice and the curve in QC.
+1. Load the treatment BAM, build binned coverage on the stratified chromosome subset (§7), cache it.
+2. Split the binned counts binomially into two halves (`Coverage.split`); more seeds give more splits.
+3. Sweep the parameter grid (27 points: posterior cutoff × fold floor × segmentation scale). For each setting, call on each half.
+4. Score with the §3.4 objective: held-out fit of each half's calls against the other half's reads, agreement between the halves, territory penalty.
+5. Take the plateau. Report the choice and the curve.
 
-Coverage is parsed once; each grid point is segmentation over in-memory arrays. A 100-point sweep on two chromosomes is seconds to low minutes, inside the §7 budget.
+The original design thinned the sample to 50% and 25% and compared those calls with full-depth calls ("every sample is deeper than a subsample of itself"). That is true, and it was the wrong comparison: the thinned copy always loses the weakest calls, so the fewer weak calls a setting makes, the better it agrees with itself, and the tuner was rewarded for calling almost nothing (§3.4). Two halves are symmetric, and neither is the reference.
+
+Coverage is parsed once; the background is fitted once per half; the HMM is fitted once per half per segmentation setting and re-thresholded at every grid point. The sweep costs ~5 s on the benchmark genome.
+
+**What the tuner can and cannot do today.** On every benchmark dataset the tuned setting reproduces the defaults within noise, which is the right answer there and the opposite of the previous behaviour. It does not yet improve on the defaults: on a shallower low-quality simulation where a 500 bp segmentation would lift F1 from 0.78 to 0.91, the half-depth objective cannot distinguish the two and keeps the default. An absolute segmentation-bin axis for the grid was measured and rejected — it rescues that case only in some configurations and costs TF-like data 5–15 F1 points, because the held-out term barely penalises boundary bloat. Sharpening the objective to boundary precision is the open problem.
 
 ### 8.2 Why this is better, not merely cheaper
 
@@ -304,6 +330,7 @@ Coverage is parsed once; each grid point is segmentation over in-memory arrays. 
 ### 8.3 Failure modes to guard
 
 - **Over-merge drift** (§3.4) — the objective's built-in bias. Mandatory territory penalty; validate specifically on broad marks, where the pull is strongest.
+- **Under-call collapse** — the symmetric failure, which the original objective did not guard and which happened (F1 7% on mixed data). The held-out fit term is the guard; a strict setting forfeits the evidence of everything it drops.
 - **Unrepresentative chromosome subset** — stratify, escalate on disagreement, surface instability in QC.
 - **Sweep cost on very large libraries** — cap via subset size, not by dropping grid points silently; log any reduction.
 
@@ -391,7 +418,14 @@ Build the harness in **P0, before the caller**. A benchmark you can re-run on ev
 | HMM beats gap-linking | Swap HMM → fixed-gap merge | Fusion and fragmentation indices rise |
 | Multi-scale enables mixed calls | Single-scale only | Sub-peak recall collapses on H3K9me3 |
 | Self-tuning adds value | Tuned vs. defaults vs. expert-tuned | Tuned ≈ expert-tuned ≫ defaults |
-| Plateau selection beats argmax | Select argmax instead | Higher variance across subsample seeds |
+| Plateau selection beats argmax | Select argmax instead | Higher variance across split seeds |
+| Held-out fit is what makes the objective two-sided | `TuningObjective(heldout_weight=0)` | Tuner collapses to a conservative corner on mixed data (measured: F1 99% → 7%) |
+| Domain-level reference for sub-peaks | `subpeak_vs_domain=False` | Flat noisy domains fill with noise sub-peaks (measured: 0 → ~150) |
+| Smoothed boundary descent | `subpeak_descent_level=0` | Focal peaks inside domains fragment below the FDR (measured: 18/18 → 5/18) |
+| Genome-scoped region FDR | `fdr_scope="candidates"` | Null false calls rise (measured: 2 → 16 at the 1.2 fold floor) |
+| Segmentation-bin floor | `min_segment_bin_bp=25` | Weak domains shred on shallow data (measured: F1 0.78 → 0.50) |
+
+The last five are implemented as `CallParams` switches, run in `tests/test_tune_and_calls.py`, and measured on the simulated benchmark; the numbers quoted are from `Benchmark/README.md`.
 
 ### 9.6 Statistical reporting
 
@@ -454,11 +488,13 @@ Development uses the open set only. The held-out datasets (§9.3) are run **once
 | **P0** | Scaffolding, packaging, CI, `NestedPeakSet` contract, BAM/bigWig I/O, binned coverage + cache, **evaluation harness + reference construction (§9) + competitor wrappers (§10)** | 4–5 weeks |
 | **P1** | NB-GLM background, NB testing, FDR, narrow calling. **Gate: match MACS3 on narrow marks; pass R4 calibration** | 3–4 weeks |
 | **P2** | NB-HMM domains + scale-space sub-peaks + nested output. **Gate: beat epic2 on fusion index; demonstrate nested calls on H3K9me3** | 5–7 weeks |
-| **P3** | Self-tuning: subsample simulation, objective, sweep, plateau selection, presets. **Gate: recovers §3.4 expert parameters unseen** | 2–3 weeks |
+| **P3** | Self-tuning: read-split validation, two-sided objective, sweep, plateau selection, presets. **Gate: recovers §3.4 expert parameters unseen** | 2–3 weeks |
 | **P4** | QC + HTML report + annotation. **Gate: the degradation-curve figure** | 3–4 weeks |
 | **P5** | Held-out evaluation, docs, bioconda/PyPI, tutorials, preprint | 4–5 weeks |
 
 P0–P2 is already a publishable, useful tool. P3 adds adaptivity with no training data and no ML dependency.
+
+**Status.** P0–P3 are implemented (P0 without CI; the evaluation harness exists for simulated data only). P3's gate — recovering the expert parameters in §3.4 unseen — has not been run; the tuner's current measured state is §8.1. P4 is partial (QC metrics and statistics figures exist; no HTML report, no annotation). P5 has not started.
 
 ## 12. Risks
 
@@ -483,12 +519,13 @@ Recorded so the reasoning isn't relitigated later.
 - **AlphaGenome / sequence-model priors.** API-gated and non-redistributable, so unusable in a bioconda package; and using predicted signal as truth imports reference bias that erases the cell-type-specific peaks that matter most. If ever revisited, open weights only (Borzoi), optional, off by default.
 - **Differential binding, motif discovery, super-enhancer stitching.** Peak calling + QC + annotation only for v1.
 
-## 14. Immediate next steps
+## 14. Next steps
 
-1. Check the `FlexPeak` name on PyPI, bioconda, and Scholar.
-2. Pick a license (MIT or BSD-3 — GPL blocks some institutional users).
-3. Scaffold: `pyproject.toml`, `src/` layout, ruff + pytest + GitHub Actions, Python ≥3.10 (local default is 3.9 — set up a dedicated env).
-4. Define the `NestedPeakSet` contract — cheapest to change now, most expensive later.
-5. Assemble the ~15–20 evaluation datasets (§9.3) and sequester the held-out set immediately, before any development.
-6. Build the evaluation harness and competitor wrappers (§10.1) **before** the caller.
-7. Build P1 and prove parity with MACS3 on CTCF, plus R4 calibration, before anything adaptive.
+Done from the original list: name, license (MIT), `pyproject.toml` + `src/` layout + pytest, the `NestedPeakSet` contract, the simulated harness with MACS2/MACS3 wrappers, P1–P3.
+
+1. **Experimental-data evaluation (§9–10).** Everything quantitative so far is on simulation drawn from the model family FlexPeak assumes. Assemble the §9.3 datasets, sequester the held-out set, and run R4 (input-vs-input) first — it is the cheapest test and the one the NB claim rests on.
+2. **The §3.4 expert-parameter gate** for the tuner on the in-house CUT&RUN set (`Code/legacy/`).
+3. **Sharpen the tuning objective to boundary precision** (§8.1): the held-out term does not yet pay enough for flank bloat to let the grid carry an absolute scale axis.
+4. **Real comparators**: epic2/SICER2 and SEACR in an environment where they build; HMMRATAC as the closest precedent.
+5. CI on the test suite; GitHub Actions; bioconda recipe.
+6. P4: HTML QC report; annotation (§6).

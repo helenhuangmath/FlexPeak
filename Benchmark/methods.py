@@ -74,12 +74,12 @@ def run_flexpeak(treat, control, params: Optional[CallParams] = None,
     if tune_first:
         from flexpeak import tune as tune_fn
 
-        res = tune_fn(treat, control, base=params, n_chroms=2,
-                      thin_fractions=(0.5,), seeds=(0,))
+        res = tune_fn(treat, control, base=params, n_chroms=2)
         params = res.params
         note = "tuned: " + ", ".join(
             f"{k}={v}" for k, v in sorted(res.params.to_dict().items())
-            if k in {"posterior_cutoff", "min_fold", "min_width"})
+            if k in {"posterior_cutoff", "min_fold", "min_width",
+                     "segment_bins_per_scale", "segment_bin_size"})
     peaks = call_peaks(treat, control, params)
     runtime = time.perf_counter() - t0
     return {
