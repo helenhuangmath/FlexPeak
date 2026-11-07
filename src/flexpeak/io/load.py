@@ -43,6 +43,20 @@ def cache_path(path, bin_size: int, chroms: Optional[Sequence[str]], cache_dir=N
     return base / f"{p.stem}.{bin_size}bp.{digest}.npz"
 
 
+def _finer_cache(path, bin_size: int, chroms: Optional[Sequence[str]],
+                 cache_dir=None) -> Optional[Coverage]:
+    """The largest cached bin size that divides ``bin_size``, for this exact
+    source file (same stamp) and chromosome set; None if there is none."""
+    for b in sorted({d for d in range(1, bin_size) if bin_size % d == 0}, reverse=True):
+        want = cache_path(path, b, chroms, cache_dir)
+        if want.exists():
+            try:
+                return Coverage.load(want)
+            except Exception:
+                continue
+    return None
+
+
 def load_signal(
     path,
     bin_size: int = 25,
@@ -71,6 +85,19 @@ def load_signal(
                 os.remove(cp)
             except OSError:
                 pass
+    if cp is not None:
+        # A finer cache of the same file and chromosomes can be coarsened
+        # instead of re-reading the source: the quick scan and a preset often
+        # ask for different bins of one file, and the read is the slow part.
+        finer = _finer_cache(path, bin_size, chroms, cache_dir)
+        if finer is not None:
+            cov = finer.rebin(bin_size)
+            try:
+                cp.parent.mkdir(parents=True, exist_ok=True)
+                cov.save(cp)
+            except OSError:
+                pass
+            return cov
 
     if fmt == "bam":
         from .bam import load_bam

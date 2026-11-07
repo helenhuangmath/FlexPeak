@@ -77,6 +77,11 @@ class Region:
     """Mean HMM posterior of being enriched across the region."""
     subpeaks: List[SubPeak] = field(default_factory=list)
     name: str = ""
+    source: str = "hmm"
+    """``"hmm"`` for a first-pass segmentation region, ``"focal"`` for a
+    focal-pass peak reported standalone.  The focal pass already corrected
+    its positions genome-wide, so the region-level FDR treats the two
+    differently (see ``caller._apply_fdr``)."""
 
     @property
     def width(self) -> int:

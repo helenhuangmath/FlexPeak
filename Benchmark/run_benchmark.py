@@ -86,6 +86,17 @@ def dataset_specs(quick: bool) -> Dict[str, Dict]:
             chrom_sizes=sizes, n_narrow=0, n_broad=0, n_mixed=0,
             dispersion=0.25, seed=105,
             description="no enrichment anywhere; every call is a false positive"),
+        # CUT&RUN / CUT&Tag-like: a near-empty background with high-contrast
+        # peaks.  SEACR is designed for exactly this -- its region unit is a
+        # block of contiguous non-zero signal, which on ChIP-like dense
+        # coverage spans hundreds of kb -- so a comparison that includes SEACR
+        # without this dataset would be judging it on data it was not built
+        # for.  It also tests the no-control claim for every method.
+        "sparse": dict(
+            chrom_sizes=sizes, n_narrow=int(40 * k), n_broad=int(3 * k) or 2,
+            n_mixed=int(2 * k) or 1, background_level=0.4, dispersion=0.5,
+            narrow_fold=40.0, broad_fold=8.0, mixed_subpeak_fold=25.0, seed=106,
+            description="sparse CUT&RUN-like: near-empty background, high-contrast peaks"),
     }
 
 
@@ -152,6 +163,26 @@ def available_methods() -> List[Dict]:
             dict(key="macs3_broad", label="MACS3 broad", kind="macs", exe=macs3,
                  broad=True, family="MACS"),
         ]
+    if shutil.which("sicer") and shutil.which("bedtools"):
+        reg += [
+            dict(key="sicer2_default", label="SICER2 (W200 G600)", kind="sicer2",
+                 family="SICER2", kw=dict(window=200, gap=600)),
+            dict(key="sicer2_broad", label="SICER2 broad (W1000 G3000)", kind="sicer2",
+                 family="SICER2", kw=dict(window=1000, gap=3000)),
+        ]
+    seacr = os.environ.get("SEACR_SH") or shutil.which("SEACR_1.3.sh")
+    if seacr and shutil.which("bedtools") and shutil.which("Rscript"):
+        reg += [
+            dict(key="seacr_stringent", label="SEACR stringent (control, norm)",
+                 kind="seacr", family="SEACR", sh=seacr,
+                 kw=dict(mode="stringent", norm="norm")),
+            dict(key="seacr_relaxed", label="SEACR relaxed (control, norm)",
+                 kind="seacr", family="SEACR", sh=seacr,
+                 kw=dict(mode="relaxed", norm="norm")),
+            dict(key="seacr_top1", label="SEACR stringent, no control, top 1%",
+                 kind="seacr", family="SEACR", sh=seacr, no_control=True,
+                 kw=dict(mode="stringent", threshold=0.01)),
+        ]
     # Each re-implemented baseline is run in several configurations -- its
     # defaults and mark-appropriate ones -- because comparing a self-tuned
     # method against fixed-parameter comparators is the strawman that
@@ -190,6 +221,13 @@ def run_method(spec: Dict, ds: Dict, outdir: str) -> Dict:
                           ds["genome_size"], os.path.join(outdir, spec["key"]),
                           f"{ds['name']}_{spec['key']}", broad=spec["broad"],
                           extsize=FRAGMENT_LEN)
+    if kind == "sicer2":
+        return M.run_sicer2(ds["treat_bam"], ds["control_bam"], ds["genome_size"],
+                            os.path.join(outdir, spec["key"]), **spec.get("kw", {}))
+    if kind == "seacr":
+        return M.run_seacr(spec["sh"], ds["treat_bam"],
+                           None if spec.get("no_control") else ds["control_bam"],
+                           os.path.join(outdir, spec["key"]), **spec.get("kw", {}))
     if kind == "sicer_like":
         return M.run_sicer_like(ds["treat"], ds["control"], **spec.get("kw", {}))
     if kind == "deseq2_like":
@@ -224,7 +262,10 @@ def main(argv=None) -> int:
     print(f"methods: {len(reg)}  datasets: {len(specs)}")
     for spec in reg:
         print(f"  - {spec['label']}")
-    missing = [t for t in ("epic2", "sicer", "SEACR") if shutil.which(t) is None]
+    missing = [t for t in ("sicer", "bedtools", "Rscript", "rgt-THOR")
+               if shutil.which(t) is None]
+    if not (os.environ.get("SEACR_SH") or shutil.which("SEACR_1.3.sh")):
+        missing.append("SEACR (set SEACR_SH)")
     if missing:
         print(f"  ! not installed, not run: {', '.join(missing)}")
 
@@ -293,10 +334,12 @@ def main(argv=None) -> int:
         for exe in ("macs2", "macs3"):
             p = shutil.which(exe)
             fh.write(f"{exe:<18} {M.tool_version(p) if p else 'NOT INSTALLED'}\n")
-        for exe in ("epic2", "sicer", "SEACR"):
-            fh.write(f"{exe:<18} "
-                     f"{'installed' if shutil.which(exe) else 'NOT INSTALLED - not run'}\n")
-        fh.write("DESeq2 (R)         NOT INSTALLED - not run\n")
+        for exe in ("sicer", "bedtools", "Rscript", "rgt-THOR"):
+            p = shutil.which(exe)
+            fh.write(f"{exe:<18} {M.tool_version(p) if p else 'NOT INSTALLED - not run'}\n")
+        seacr = os.environ.get("SEACR_SH") or shutil.which("SEACR_1.3.sh")
+        fh.write(f"{'SEACR':<18} {seacr or 'NOT INSTALLED - not run'}\n")
+        fh.write("DESeq2 (R)         NOT RUN (re-implemented baseline only)\n")
         for mod in ("numpy", "scipy", "pysam", "numba"):
             try:
                 fh.write(f"{mod:<18} {__import__(mod).__version__}\n")

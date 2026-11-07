@@ -13,6 +13,7 @@ from .background.nb import BackgroundModel
 from .io.load import load_signal
 from .tune.sweep import tune, TuneResult
 from .tune.objective import TuningObjective
+from .scan import scan_coverage, scan_file, ScanProfile
 
 __all__ = [
     "__version__",
@@ -21,4 +22,5 @@ __all__ = [
     "CallParams", "call_peaks", "preset_params", "PRESETS",
     "BackgroundModel",
     "tune", "TuneResult", "TuningObjective",
+    "scan_coverage", "scan_file", "ScanProfile",
 ]

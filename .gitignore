@@ -1,8 +1,21 @@
 __pycache__/
 *.pyc
+*.egg-info/
 .pytest_cache/
 .ruff_cache/
+.DS_Store
+build/
 examples/tutorial_out/
-testing/data/
-testing/results/
-testing/cache/
+
+# Heavy or transient material lives in ../FlexPeak_work (symlinked here; never committed)
+testing/data
+testing/results
+testing/cache
+cluster/logs
+tmp
+Benchmark/data
+Benchmark/data_diff
+Benchmark/results/macs_raw
+Benchmark/results/calls
+Benchmark/results_diff/raw
+Benchmark/results_diff/calls

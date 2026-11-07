@@ -1,0 +1,8 @@
+generated          2026-11-06 08:31:30
+platform           Linux-6.8.0-117-generic-x86_64-with-glibc2.39
+python             3.10.22
+flexpeak           0.1.0
+rgt-THOR           1.0.2
+macs2              macs2 2.2.9.1
+sicer_df           usage: Use --help or -h for more information
+bedtools           bedtools v2.31.1

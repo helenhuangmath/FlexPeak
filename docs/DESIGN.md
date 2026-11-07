@@ -529,3 +529,249 @@ Done from the original list: name, license (MIT), `pyproject.toml` + `src/` layo
 4. **Real comparators**: epic2/SICER2 and SEACR in an environment where they build; HMMRATAC as the closest precedent.
 5. CI on the test suite; GitHub Actions; bioconda recipe.
 6. P4: HTML QC report; annotation (§6).
+
+---
+
+## 15. Additions, November 2026: quick scan, similarity merge, differential calling
+
+### 15.1 Quick scan (`flexpeak.scan`)
+
+A pre-pass that profiles a 60 Mb central window of one chromosome (chr1 by
+default) at several bin sizes (10, 25, 50 bp) before the full load. Per bin
+size it reports the count distribution, a background by **iterative sigma
+clipping** (median/MAD start, clip above mean + 5 SD, re-estimate on what is
+left, repeat), the NB dispersion of the clipped bins, the observed fraction
+of bins beyond the threshold against the fraction an NB with the clipped
+moments would put there (the difference is the **signal excess**), the
+high-passed autocorrelation length, and the run and gap lengths of the bins
+beyond the threshold. The same clip is applied to the signal smoothed at
+1 kb and 5 kb after a chunk-quantile baseline (lower quintile per 200 kb,
+interpolated) has been subtracted, against the measurement-noise SD of a
+k-bin mean (floored at the lower-tail spread of the corrected track) and
+gated by a 1.5x fold over the local baseline; runs of that mask give the
+domain widths.
+
+Why the NB correction: at 10 bp a sparse library puts a few percent of pure
+noise beyond 5 SD, so the raw 5-SD tail is not a signal estimate; the excess
+over the NB expectation is. Why the baseline and the noise SD: a global clip
+on a smoothed track is dominated by baseline drift, under which a 2.5x
+domain hides (measured: zero smoothed excess for six 80 kb domains).
+
+**Classification** (every rule is written into the report):
+
+* *focal* -- bin-level excess >= 0.001 **and** SNR >= 10, where SNR is the
+  99.9th percentile's distance from the clipped mean in clipped SDs. The SNR
+  gate exists because a weak domain mark puts a few strong cores beyond
+  5 SD (H3K9me3 CUT&RUN: excess 0.001 at SNR 6; CTCF: SNR 45).
+* *domain* -- smoothed excess >= 0.002 and either the p90 run width at 5 kb
+  smoothing is >= 3x the filter, or the smoothed excess is more than twice
+  what the bin-level runs smeared by the filter would produce. The second
+  clause is what keeps a borderline domain mark from being labelled narrow:
+  narrow background windows (1-10 kb) under a domain mark absorb the
+  domains (measured on H3K9me3: 3,880 regions -> 70, FRiP 0.12 -> 0.0004),
+  whereas broad settings on a punctate mark only cost resolution.
+* narrow = focal only; broad = domain only; mixed = both; null = neither.
+
+Measured on the five GSE285245 pooled marks (chr1): CTCF narrow, H3K4me3 and
+H3K27ac mixed, H3K27me3 mixed (domain-dominated, 2 kb segmentation),
+H3K9me3 broad (100 bp bin, 400 bp segmentation -- the setting §3.3c had
+found best for it by hand).
+
+**Parameters from the class.** Bin size: narrow marks take the largest
+candidate with >= 20 bins per feature (CTCF at 750 bp scale -> 25 bp; a
+200 bp TF peak -> 10 bp), because a 10 bp genome-wide call costs ~10x a
+100 bp one; broad marks take 100 bp. Background windows: >= 10x the domain
+scale for broad and mixed marks (capped at 200 kb / 1 Mb), MACS's 1/5/10 kb
+for narrow. Segmentation bin: domain scale / 20 for broad and
+domain-dominated mixed marks. `max_gap` from the lower quartile of inter-run
+gaps, capped by the feature scale. A 4-point tuning grid (confidence x fold
+floor). `callpeak --quick` runs the scan, applies the recommendation and
+sweeps that grid on one chromosome.
+
+**Cost.** The scan itself takes 2-15 s. On the pooled H3K9me3 bigWig
+(chr1-19+X, cold cache, one job) `--quick` took 66 s against 95 s for the
+full 27-point sweep with `--preset h3k9me3` and 44 s with no tuning; it
+called 3,725 regions on 1.4% of the genome at FRiP 0.10 (7.2 signal units
+per called base) against 3,880 on 2.4% at FRiP 0.12 (5.2) for the preset
+sweep. Three measured dead ends on the way to that number, all recorded in
+the code: profiling all 195 Mb of chr1 cost 55 s for nothing; a narrow
+label on this borderline mark put 1-10 kb background windows under its
+domains and erased them (70 regions, FRiP 0.0004); and a 10-50 bp bin for a
+domain-dominated mark doubled or tripled every downstream pass.
+
+The punctate case is the expensive one. A single CUT&RUN CTCF replicate
+(scale ~300 bp, so 10 bp bins, 263M bins genome-wide, ~12,700 regions)
+first took 1,003 s and 19 GB under `--quick`. Profiling found three
+O(regions x chromosome) or O(genome) costs that had been invisible on the
+benchmark genome: region statistics built one SciPy call at a time
+(vectorised, §15.4), a whole-chromosome product inside every sub-peak call
+(sliced), and the dispersion trend plus autocorrelation inflation fitted on
+all 263M bins with float64 copies and a full sort (now a 4M-bin subsample,
+bit-identical below that size). The sweep also no longer calls sub-peaks.
+Result: scan 5 s, load 1 s, one-chromosome sweep 30 s, genome-wide call
+213 s -- 250 s in all, and 37 tests in 11 s instead of 27.
+
+### 15.2 Connecting nearby similar measurements (`CallParams.gap_fold_fraction`)
+
+`max_gap` used to be a plain distance merge, off by default because a fixed
+gap is the SICER over-merge mechanism. It is now gated: two regions within
+`max_gap` are joined only when the gap's own observed/expected fold reaches
+`gap_fold_fraction` (0.5) of the weaker neighbour's fold and `min_fold`. A gap
+at background keeps them apart whatever its length. The scan sets `max_gap`
+from the lower quartile of inter-run gaps, capped by the feature scale.
+
+### 15.3 The focal pass: MACS's local lambda, nested (November 6)
+
+Looking at the called tracks at Havcr2 and Tcf7 showed two failures. A
+"mixed" mark (H3K4me3, H3K27ac) was called with only 150-750 kb background
+windows, so the valleys between promoter peaks sat far above background
+and the HMM fused a whole promoter cluster into one 40-85 kb region, with
+the scale-space sub-peak descending to the region's edges. And H3K27me3
+domains at Havcr2 were not called at all.
+
+**Why MACS gets narrow H3K4me3 peaks.** Its lambda is the max over 1/5/10 kb
+local windows (treatment-only: the 10 kb window alone), *peaks included*,
+so inside a cluster the background rises to the cluster's own level and
+only the summits exceed it. A wide-window background cannot do that.
+
+**The focal pass** (`CallParams.focal_pass`, on whenever ``windows`` are all
+wider than ``focal_windows``): a second background, the plain local means
+over the focal windows (10 kb without a control; 1/5/10 kb from the control
+with one) maxed with the wide background; a sliding sum over the focal
+feature scale (high-passed autocorrelation length, 200-1000 bp) stepped at
+the fine segmentation bin; an NB tail test of each sum against its focal
+mean, with the dispersion *measured on the sums themselves*; BH over every
+position in the genome; runs of significant positions, joined across two
+bins, floored at ``min_width`` and a 1.3x fold over the local mean. Each
+focal region becomes a sub-peak of the first-pass region it falls in
+(tested against the local level, which is what "a peak inside a domain"
+means) or a standalone ``peak``.
+
+Five measured dead ends on the way, all in the code comments: (1) signal
+exclusion in the focal background held out every bin of a continuous
+cluster and the windows fell back to the floor (one 48 kb "sub-peak");
+(2) the 1 kb plain mean of the treatment at a summit *is* the summit
+(fold 1 everywhere); (3) a fitted HMM against a background that already
+follows the signal has nothing to fit (3 focal regions on chr11); (4) a
+per-bin NB test on a normalised track at alpha 1-1.6 cannot see a 2.5x
+summit; (5) propagating that alpha through a lag-1 inflation of 19 left a
+500 bp sum at 2.7x worth 1.6 log units. Measuring the dispersion of the
+window sums directly, as a sliding pileup with a fitted NB, is what works:
+Havcr2 now has seven H3K4me3 and six H3K27ac promoter sub-peaks of 0.5-3 kb
+and CTCF sub-peaks of 250-350 bp.
+
+**A domain must stand on its residual.** Once focal peaks are attached,
+the parent region is re-tested with the focal bins taken out: the residual
+must reach ``min_fold`` and the p-value cut under the same AR(1)-inflated
+NB test as any region, or the region dissolves and its focal peaks are
+reported standalone. Without this, a run of narrow peaks over a slightly
+drifted background passes as one "domain" whose fold is entirely the
+peaks' -- measured when the segmentation dispersion was corrected (15.4a):
+the h3k27me3 preset on the simulated narrow set produced 79 kb regions at
+1.5x average fold (precision 0.17, F1 0.29); with the residual test it is
+back at F1 0.85 and no preset parameter needed changing.
+
+**H3K27me3 at Havcr2** was two problems: the background floor re-read from
+the kept bins' *mean* (7.4 against a chromosome median of 2.3) is now the
+sigma-clipped mode of the smoothed track, iterated to convergence; and a
+weak Polycomb neighbourhood several hundred kb wide became its own
+background at 200 kb / 1 Mb windows, so domain marks now get 1 Mb / 5 Mb
+(presets and scan). Floor-only (no windows) was measured and rejected: the
+whole chromosome became one domain. The widening changes what H3K9me3
+reports: 62 Mb of territory in 3,880 regions became ~340 Mb in ~2,300
+domains, the heterochromatin landscape rather than its local structure;
+the sub-peaks carry the latter, and ``--windows 200000,1000000`` restores
+the former.
+
+**The floor is the median of the smoothed track.** Three statistics were
+measured for the floor on GSE285245 H3K27me3 (chr11, 100 bp; median bin
+2.3, lower quartile 0.6) and on a per-replicate CUT&RUN CTCF bigWig at
+10 bp (72-84% zero bins). The mean of the bins a 2x exclusion keeps (7.4)
+made a 4x Havcr2 domain measure 1.1x. A 5-SD sigma-clipped centre of the
+smoothed track (8.2) is no better on a broad mark: its domains sit inside
+5 SD, the clip removes nothing, and the result is the mean of background
+plus domains; on the sparse track the same clip slid into the zero mass
+(chrX: 0.58 against a rate of 6.3, 113 Mb of chrX "called"), and
+re-reading it on the kept bins at every exclusion pass turned that into a
+runaway (chr1: 5.2 to 0.001, 117 Mb called). The floor is now the median
+of the smoothed track, read at the first smoothing scale at which the
+track is not zero-inflated (median > 0), and only the window means are
+iterated against it.
+
+### 15.4 Speed work, recorded
+
+* `tune()` sweeps with `call_subpeaks=False` and restores it for the final
+  parameters: sub-peaks depend on nothing the grid varies, and scale-space
+  detection in every region at every grid point on both read halves was most
+  of the sweep on punctate marks.
+* `_build_regions` replaces the per-region builder: prefix sums for every
+  aggregate and one vectorised NB test per chromosome (`tests/
+  test_regions_vectorised.py` pins equality with the per-region version).
+* `_call_subpeaks` works on slices only.
+* `BackgroundModel.fit` fits the mean-dispersion trend on a strided 4M-bin
+  subsample and the lag-1 inflation on a contiguous 4M-bin block.
+* The coverage cache serves a coarser bin by rebinning a finer cached file
+  of the same source and chromosome set.
+
+### 15.4a Variance of region sums: finite-length AR(1) and segmentation-scale dispersion (November 6)
+
+Per-replicate in-house tracks (one CTCF replicate, ~5 M fragments) exposed
+two places where the region test assumed too much:
+
+* **Autocorrelation inflation was applied as the infinite-sum limit.** The
+  variance of a sum of `n` AR(1)-correlated bins with lag-1 correlation
+  `rho` is `n * var * ar1_factor(n, rho)` with
+  `ar1_factor = 1 + 2 rho/(1-rho) * (1 - (1-rho^n)/(n(1-rho)))`, which tends
+  to `(1+rho)/(1-rho)` only for `n >> 1/(1-rho)`. The old code used the
+  limit for every region, which over-inflated short regions (a 3-bin region
+  at `rho=0.9` has a factor of ~4.5, not 19) and, after the dispersion
+  trend was clipped, lost power uniformly. `stats/nbtest.py` now carries
+  `ar1_factor` and `rho_from_inflation`; `_build_regions` uses the finite
+  factor for each region's bin count.
+* **HMM emissions used the bin-level dispersion on bin sums.** When the
+  segmentation runs on coarsened bins (`factor > 1`), the emission
+  dispersion is now fitted on the coarsened sums themselves
+  (`seg_dispersion` cache key) rather than carried over from the base bins.
+  For a sparse track the base-bin fit hits the trend clip (`a1 = 100`) and
+  declared almost every coarsened sum "enriched"; the per-replicate CTCF
+  territory went from 1.6 Gb to 2.3 Mb on chr11 after the two fixes.
+
+Both changes leave the simulated-benchmark rows unchanged to the reported
+precision (pooled tracks are deep enough that neither limit was binding).
+
+### 15.5 Differential calling (`flexpeak.diff`)
+
+THOR's structure (an HMM over the two-condition signal with states same /
+higher-in-1 / higher-in-2) with a different emission: **beta-binomial on the
+split conditional on the total**, so no background model is needed, depth is
+factored out bin by bin, and empty bins are uninformative rather than
+"same". Overdispersion is read from replicate-to-replicate scatter (method of
+moments) when replicates exist, else re-estimated inside the EM from the
+"same" state. Normalisation matches the sigma-clipped background levels by
+default (a global gain in one condition must not be normalised into loss
+elsewhere); TMM and library size are available. The dwell floor comes from the
+pooled signal's autocorrelation length, as in the peak HMM. Region p-values
+are two-sided beta-binomial on the aggregate split with a *region-scale*
+overdispersion (replicate scatter of region sums, shrunk toward a BCV-0.2
+prior; the prior alone without replicates), BH over the candidates. Two
+measured failures shaped this: pooled single-sample bigWigs gave 390,588
+"differential" H3K27me3 regions with an EM-estimated per-bin rho of 0.002,
+and summing independent per-bin overdispersions made every long run at ~1.8x
+significant (543,181 H3K4me3 regions); BH over genome-sized tiles, on the
+other hand, removed every true call on simulated two-replicate data. Two more
+measured guards: bigWig values are divided by the background variance/mean
+of each sample (its units per fragment; the robust MAD-based variance, since
+weak domains survive a 5 SD clip), and bins are coarsened until the two
+conditions average >= 10 fragments per bin (CUT&RUN CTCF at 50 bp: 0.4
+fragments per bin, 2.7 million HMM candidates). And an enrichment gate: a region must reach 1.5x
+over the input, or over the pooled signal's own local background (100 kb /
+500 kb windows with apparent signal held out; narrower windows made a 40 kb
+domain its own background), in at least one condition -- measured on 4 vs 4
+CUT&RUN CTCF, without it the chain returned 23,099 regions of median 10 kb
+with both states pinned at the 1.5x floor, i.e. regional background
+differences between the pooled conditions. Output is signed narrowPeak
+plus a TSV with per-replicate counts.
+
+Comparators in `Benchmark/run_diff_benchmark.py`: THOR, MACS2 bdgdiff,
+SICER2 sicer_df, on `simulate_differential()` data with known gains, losses,
+shared peaks, depth imbalance and a null set.

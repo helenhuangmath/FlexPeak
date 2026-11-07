@@ -8,8 +8,8 @@ import numpy as np
 from scipy import stats
 
 __all__ = ["nb_neglog10_sf", "poisson_neglog10_sf", "benjamini_hochberg",
-           "qvalue_from_neglog10p", "aggregate_nb_params",
-           "autocorrelation_inflation", "autocorrelation_length_bp"]
+           "qvalue_from_neglog10p", "aggregate_nb_params", "ar1_factor",
+           "rho_from_inflation", "autocorrelation_inflation", "autocorrelation_length_bp"]
 
 _LOG10 = np.log(10.0)
 
@@ -126,8 +126,36 @@ def autocorrelation_length_bp(signal, bin_size: int, max_lag_bp: int = 200_000,
     return int(max(lag, 1) * bin_size)
 
 
+def ar1_factor(n, rho: float) -> np.ndarray:
+    """Variance factor of a sum of ``n`` consecutive AR(1) bins, exactly.
+
+    ``(1 + rho) / (1 - rho)`` is the limit for a long sum; for a short one the
+    factor is much smaller: at rho 0.9 it is 3.5 for 4 bins and 5.3 for 7,
+    against 19 in the limit.  Applying the limit everywhere widened the
+    HMM's emissions on normalised CUT&RUN tracks (rho ~0.9 at 10-25 bp)
+    until its states were indistinguishable and a sparse H3K9me3 replicate
+    came out with nothing called; the exact factor keeps the honesty about
+    correlated bins without that penalty.
+
+        f(n) = 1 + 2 rho / (1 - rho) * (1 - (1 - rho^n) / (n (1 - rho)))
+    """
+    n = np.asarray(n, dtype=np.float64)
+    rho = float(min(max(rho, 0.0), 0.999))
+    if rho <= 1e-9:
+        return np.ones_like(n)
+    with np.errstate(over="ignore", invalid="ignore"):
+        f = 1.0 + 2.0 * rho / (1.0 - rho) * (1.0 - (1.0 - rho ** n) / (n * (1.0 - rho)))
+    return np.where(n > 1, np.maximum(f, 1.0), 1.0)
+
+
+def rho_from_inflation(inflation: float) -> float:
+    """Invert ``(1 + rho) / (1 - rho)``."""
+    inflation = max(float(inflation), 1.0)
+    return float((inflation - 1.0) / (inflation + 1.0))
+
+
 def aggregate_nb_params(mu_bins, alpha_bins, counts=None, max_rho: float = 0.95,
-                        inflation: Optional[float] = None):
+                        inflation: Optional[float] = None, rho: Optional[float] = None):
     """Dispersion for the SUM of several bins.  Returns ``(mu_total, alpha_eff)``.
 
     Testing a whole region means testing a sum, and the per-bin dispersion is
@@ -173,6 +201,8 @@ def aggregate_nb_params(mu_bins, alpha_bins, counts=None, max_rho: float = 0.95,
                 rho = min(max(rho, 0.0), max_rho)
                 inflation = (1.0 + rho) / (1.0 - rho)
 
+    if rho is not None:
+        inflation = float(ar1_factor(mu.size, rho))
     var = inflation * var_indep
     alpha_eff = (var - mu_total) / (mu_total * mu_total)
     return mu_total, float(max(alpha_eff, 1e-10))

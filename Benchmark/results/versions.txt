@@ -1,0 +1,16 @@
+generated          2026-11-06 07:28:30
+platform           Linux-6.8.0-117-generic-x86_64-with-glibc2.39
+python             3.10.22
+flexpeak           0.1.0
+macs2              macs2 2.2.9.1
+macs3              macs3 3.0.4
+sicer              usage: Use --help or -h for more information
+bedtools           bedtools v2.31.1
+Rscript            Rscript (R) version 4.3.3 (2024-02-29)
+rgt-THOR           1.0.2
+SEACR              /vast/projects/wherry/foundation-models-immuno/hhua/tools/SEACR/SEACR_1.3.sh
+DESeq2 (R)         NOT RUN (re-implemented baseline only)
+numpy              2.2.6
+scipy              1.15.2
+pysam              0.24.1
+numba              0.67.0

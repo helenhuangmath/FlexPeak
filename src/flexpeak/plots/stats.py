@@ -17,7 +17,7 @@ later.  All output is set in Arial with black text (vector PDF by default) (see 
 from __future__ import annotations
 
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -80,17 +80,46 @@ def _log_bins(vals: np.ndarray, n: int = 34):
 def _quantiles(vals) -> Dict[str, float]:
     v = _finite(np.asarray(vals, dtype=np.float64))
     if v.size == 0:
-        return {"n": 0, "min": 0.0, "q25": 0.0, "median": 0.0, "q75": 0.0,
-                "mean": 0.0, "max": 0.0}
+        return {"n": 0, "min": 0.0, "q05": 0.0, "q25": 0.0, "median": 0.0, "q75": 0.0,
+                "q95": 0.0, "mean": 0.0, "max": 0.0}
     return {
         "n": int(v.size),
         "min": float(v.min()),
+        "q05": float(np.percentile(v, 5)),
         "q25": float(np.percentile(v, 25)),
         "median": float(np.median(v)),
         "q75": float(np.percentile(v, 75)),
+        "q95": float(np.percentile(v, 95)),
         "mean": float(v.mean()),
         "max": float(v.max()),
     }
+
+
+WIDTH_EDGES = (0, 200, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000,
+               500_000)
+"""Width classes (bp) of the summary histogram; the last class is open."""
+
+
+def _fmt_bp(v: float) -> str:
+    v = float(v)
+    if v >= 1_000_000:
+        return f"{v / 1e6:g} Mb"
+    if v >= 1_000:
+        return f"{v / 1e3:g} kb"
+    return f"{v:g} bp"
+
+
+def width_histogram(widths, edges: Sequence[int] = WIDTH_EDGES) -> List[Dict]:
+    """Counts and territory per width class: ``[{lo, hi, label, n, bp}, ...]``."""
+    w = np.asarray(widths, dtype=np.float64)
+    out = []
+    for i, lo in enumerate(edges):
+        hi = edges[i + 1] if i + 1 < len(edges) else None
+        sel = (w >= lo) & (w < hi) if hi is not None else (w >= lo)
+        label = (f"{_fmt_bp(lo)}-{_fmt_bp(hi)}" if hi is not None else f">= {_fmt_bp(lo)}")
+        out.append({"lo": int(lo), "hi": int(hi) if hi is not None else None, "label": label,
+                    "n": int(sel.sum()), "bp": int(w[sel].sum())})
+    return out
 
 
 def peak_stats(peaks: NestedPeakSet) -> Dict:
@@ -138,12 +167,27 @@ def peak_stats(peaks: NestedPeakSet) -> Dict:
         "n_infinite_q": int((~np.isfinite(qs)).sum()),
         "subpeaks_per_region": _quantiles(n_sub_per),
         "per_chrom": per_chrom,
+        "by_kind_source": _by_kind_source(regions),
+        "width_by_kind": {
+            k: _quantiles([r.width for r in regions if r.kind == k]) for k in ("domain", "peak")
+        },
+        "width_histogram": width_histogram(widths),
+        "subpeak_width_histogram": width_histogram(sub_widths),
+        "focal_scales": list((((peaks.params or {}).get("call") or {}).get("focal_scales")) or []),
         "domain_min_width": _call_param(peaks, "domain_min_width", 2000),
         "min_fold": _call_param(peaks, "min_fold", 0.0),
         "qvalue": _call_param(peaks, "qvalue", 0.05),
         "treatment": (peaks.params or {}).get("treatment"),
         "approximate_pvalues": bool((peaks.params or {}).get("approximate_pvalues")),
     }
+
+
+def _by_kind_source(regions) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for r in regions:
+        k = f"{r.kind}/{getattr(r, 'source', 'hmm')}"
+        out[k] = out.get(k, 0) + 1
+    return dict(sorted(out.items()))
 
 
 _SUMMARY_ROWS = (
@@ -172,6 +216,46 @@ def format_stats(s: Dict) -> str:
     if s["subpeak_width"]["n"]:
         lines.append(f"  {'median sub-peak width':<26} "
                      f"{s['subpeak_width']['median']:,.0f} bp")
+    if s.get("by_kind_source"):
+        lines.append("")
+        lines.append("  regions by kind / origin (hmm = domain segmentation, focal = "
+                     "sliding-window pass)")
+        for k, v in s["by_kind_source"].items():
+            lines.append(f"    {k:<24} {v:>10,}")
+    if s.get("focal_scales"):
+        lines.append(f"  {'focal windows':<26} "
+                     + ", ".join(f"{w:,}" for w in s["focal_scales"]) + " bp")
+
+    def _qrow(label, q):
+        return (f"  {label:<14} n={q['n']:>9,}  p5 {q['q05']:>9,.0f}  p25 {q['q25']:>9,.0f}  "
+                f"median {q['median']:>9,.0f}  p75 {q['q75']:>9,.0f}  p95 {q['q95']:>10,.0f}  "
+                f"max {q['max']:>11,.0f}")
+
+    lines += ["", "  width distribution (bp)"]
+    lines.append(_qrow("all regions", s["width"]))
+    for k in ("domain", "peak"):
+        q = s.get("width_by_kind", {}).get(k)
+        if q and q["n"]:
+            lines.append(_qrow(k + "s", q))
+    if s["subpeak_width"]["n"]:
+        lines.append(_qrow("sub-peaks", s["subpeak_width"]))
+
+    def _hist(title, hist, total_n):
+        lines.append("")
+        lines.append(f"  {title}")
+        lines.append(f"    {'width':<18} {'n':>10} {'%':>7} {'territory':>12}")
+        peak = max((h["n"] for h in hist), default=0) or 1
+        last = max((i for i, h in enumerate(hist) if h["n"]), default=-1)
+        for h in hist[: last + 1]:
+            pct = 100.0 * h["n"] / total_n if total_n else 0.0
+            bar = "#" * int(round(30 * h["n"] / peak))
+            lines.append(f"    {h['label']:<18} {h['n']:>10,} {pct:>6.1f}% "
+                         f"{h['bp'] / 1e6:>9,.2f} Mb  {bar}")
+
+    if s.get("width_histogram"):
+        _hist("region width histogram", s["width_histogram"], s["n_regions"])
+    if s.get("subpeak_width_histogram") and s["n_subpeaks"]:
+        _hist("sub-peak width histogram", s["subpeak_width_histogram"], s["n_subpeaks"])
     if s["approximate_pvalues"]:
         lines.append("")
         lines.append("  NOTE: input was not raw counts; p/q-values are approximate.")

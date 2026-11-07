@@ -27,13 +27,17 @@ __all__ = ["BackgroundModel", "estimate_dispersion", "local_lambda",
            "check_window_scale", "exclusion_smoothing_bp"]
 
 
+#: Bins used to fit the dispersion trend and the autocorrelation inflation.
+_FIT_MAX_BINS = 4_000_000
+
 #: Cap on the trimming-bias correction.  A larger value than this means the
 #: exclusion is removing most of the distribution, not its signal tail.
 _MAX_TRIM_CORRECTION = 3.0
 
 
 def _trim_correction(plain: np.ndarray, masked: np.ndarray, den: np.ndarray,
-                     quiet_quantile: float = 0.75) -> float:
+                     quiet_quantile: float = 0.75,
+                     quiet_min_den: Optional[float] = None) -> float:
     """Undo the downward bias that one-sided exclusion introduces.
 
     Excluding only bins *above* a threshold trims one tail, so the mean of what
@@ -51,7 +55,19 @@ def _trim_correction(plain: np.ndarray, masked: np.ndarray, den: np.ndarray,
     estimator collapses back to the plain mean -- which is what keeps the null
     calibration intact.
     """
-    quiet = den >= np.quantile(den, quiet_quantile)
+    if quiet_min_den is not None:
+        # Absolute rather than relative quietness.  At megabase windows on a
+        # domain mark no window is free of signal, and "the quietest quarter"
+        # still had a fifth of its bins held out as real enrichment: the
+        # ratio then measured the signal fraction, not the trimming bias
+        # (GSE285245 H3K27me3 chr11, 5 Mb: 2.2x, which lifted the whole
+        # background to 2-3x the true level).  Only windows that lost at most
+        # 1 - quiet_min_den of their bins estimate the bias; none -> no
+        # correction (with a 5 kb judging scale, noise almost never crosses
+        # 2x, so the bias it would measure is ~1 anyway).
+        quiet = den >= quiet_min_den
+    else:
+        quiet = den >= np.quantile(den, quiet_quantile)
     usable = quiet & (masked > 0) & np.isfinite(masked) & np.isfinite(plain)
     if not usable.any():
         return 1.0
@@ -63,7 +79,8 @@ def _trim_correction(plain: np.ndarray, masked: np.ndarray, den: np.ndarray,
 
 def _window_max(arr: np.ndarray, weights: Optional[np.ndarray], bin_size: int,
                 windows: Sequence[int], floor: float,
-                min_weight: float = 0.05) -> np.ndarray:
+                min_weight: float = 0.05,
+                quiet_min_den: Optional[float] = None) -> np.ndarray:
     """Max over window scales of the (optionally weighted) local mean."""
     out = np.full(arr.shape, floor, dtype=np.float32)
     for w in windows:
@@ -81,8 +98,39 @@ def _window_max(arr: np.ndarray, weights: Optional[np.ndarray], bin_size: int,
             # ratio of two near-zero numbers.
             sm = np.where(den > min_weight, num / np.maximum(den, 1e-6), floor)
             sm = np.nan_to_num(sm, nan=floor, posinf=floor, neginf=floor)
-            sm = sm * _trim_correction(plain, sm, den)
+            sm = sm * _trim_correction(plain, sm, den, quiet_min_den=quiet_min_den)
         np.maximum(out, sm.astype(np.float32), out=out)
+    return out
+
+
+def _window_median(x: np.ndarray, bin_size: int, windows: Sequence[int],
+                   floor: float, blocks_per_window: int = 8) -> np.ndarray:
+    """Max over window scales of a running median, per bin.
+
+    Approximated as the median of block medians (``blocks_per_window`` blocks
+    per window, a running median of ``blocks_per_window + 1`` blocks),
+    interpolated between block centres: O(n) and seconds on a whole genome,
+    where an exact running median over a 1 Mb window is not.
+    """
+    from scipy.ndimage import median_filter
+
+    x = np.asarray(x, dtype=np.float32)
+    n = x.size
+    out = np.full(n, floor, dtype=np.float32)
+    for w in windows:
+        k = min(max(1, int(round(w / bin_size))), max(1, n // 2))
+        B = max(1, k // blocks_per_window)
+        nb = n // B
+        if nb < 3:
+            np.maximum(out, np.float32(np.median(x)), out=out)
+            continue
+        blk = np.median(x[: nb * B].reshape(nb, B), axis=1)
+        centres = (np.arange(nb) + 0.5) * B
+        if nb * B < n:
+            blk = np.append(blk, np.median(x[nb * B:]))
+            centres = np.append(centres, (nb * B + n) / 2.0)
+        sm = median_filter(blk, size=blocks_per_window + 1, mode="nearest")
+        np.maximum(out, np.interp(np.arange(n), centres, sm).astype(np.float32), out=out)
     return out
 
 
@@ -115,6 +163,7 @@ def local_lambda(
     exclude_fold: float = 2.0,
     exclude_iters: int = 3,
     exclude_smooth_bp: Optional[int] = None,
+    robust_start: bool = False,
 ) -> np.ndarray:
     """MACS-style local background: max over several window scales.
 
@@ -138,6 +187,21 @@ def local_lambda(
     Measured on the CUT&RUN samples in ``testing/``: median fold enrichment in
     the top 5% of bins rose 2.5x -> 8.0x (H3K27ac) and 3.6x -> 26.6x (H3K27me3),
     and H3K27me3 domains stopped being shredded into ~800 bp fragments.
+
+    ``robust_start`` anchors the exclusion on a running median of the
+    smoothed track: bins are held out above ``exclude_fold`` x min(current
+    estimate, median), so the threshold can fall but never rise above twice
+    the median.  The plain iteration has a self-consistent fixed point on a
+    mark with a lot of moderate enrichment: everything below twice the
+    estimate is kept, which lifts the estimate, which keeps more.  Measured
+    on GSE285245 H3K27me3 chr11 (100 bp, 1 Mb / 5 Mb): the gap next to
+    Havcr2 is at 2.4 and the chromosome median bin 3.0, but the background
+    converged to 5.8 there (chromosome median 7.8), so a 23 kb block at 9.7
+    -- 4x the true level -- read 1.7x.  A median does not move until
+    enrichment fills half the window.  On background alone the smoothed
+    track is near-symmetric, median ~ mean, nothing crosses the threshold
+    either way, and the masked mean with its trimming correction is still
+    the estimate.
     """
     arr32 = np.ascontiguousarray(arr, dtype=np.float32)
     floor = max(float(genome_mean), 1e-9)
@@ -150,20 +214,47 @@ def local_lambda(
     judged = (uniform_filter1d(arr32, size=k_s, mode="nearest")
               if k_s > 1 else arr32)
 
-    lam = _window_max(arr32, None, bin_size, windows, floor)
-    for _ in range(int(exclude_iters)):
-        keep = (judged <= exclude_fold * lam).astype(np.float32)
-        # The floor is meant to be "the average background level", the guard
-        # that stops peaks being called in anomalously quiet regions.  The
-        # genome mean is not that number once an appreciable fraction of the
-        # genome is enriched: an H3K9me3 sample with a fifth of the genome in
-        # domains carries its own domains in its mean, so the floor sits above
-        # the real background and the weaker half of every domain is scored as
-        # depleted.  Re-read it from the bins the exclusion kept.
-        kept = float(keep.sum())
-        if kept > 0.01 * keep.size:
-            floor = max(float((arr32 * keep).sum() / kept), 1e-9)
-        lam = _window_max(arr32, keep, bin_size, windows, floor)
+    # The floor is meant to be "the background level", the guard that stops
+    # peaks being called in anomalously quiet regions.  Three statistics were
+    # measured for it on GSE285245 H3K27me3 (chr11, 100 bp; median bin 2.3,
+    # lower quartile 0.6) and a per-replicate CUT&RUN CTCF bigWig at 10 bp:
+    #
+    # * the mean of the bins a 2x exclusion keeps: 7.4 on H3K27me3, so a 4x
+    #   domain at Havcr2 measured 1.1x and was never called;
+    # * a 5-SD sigma-clipped centre of the smoothed track: 8.2 on H3K27me3
+    #   -- a broad mark's domains sit well inside 5 SD, so the clip removes
+    #   nothing and returns the mean of background plus domains; and on the
+    #   sparse CTCF track it slid into the zero mass (chrX: 0.58 against a
+    #   rate of 6.3, with 113 Mb of chrX then "called").  Re-reading it on
+    #   the kept bins at every exclusion pass made that a runaway (chr1:
+    #   5.2 -> 0.001);
+    # * the median of the smoothed track, read at the first smoothing scale
+    #   at which the track is not zero-inflated (median > 0): 2-3 on
+    #   H3K27me3, the rate on the sparse track.  That is the number the
+    #   other two were being judged against, so it is the floor.
+    #
+    # The exclusion then iterates the window means against this fixed floor.
+    k_f, judged_f = k_s, judged
+    cap = max(1, int(max(windows) // bin_size)) if windows else k_s
+    while float(np.median(judged_f)) <= 0.0 and k_f < cap:
+        k_f = min(k_f * 2, cap)
+        judged_f = uniform_filter1d(arr32, size=k_f, mode="nearest")
+    floor = max(min(floor, float(np.median(judged_f))), 1e-9)
+    anchor = None
+    if robust_start:
+        anchor = _window_median(judged, bin_size, windows, floor)
+        lam = anchor
+    else:
+        lam = _window_max(arr32, None, bin_size, windows, floor)
+    for _ in range(max(int(exclude_iters), 1) * 2):
+        thr = lam if anchor is None else np.minimum(lam, anchor)
+        keep = (judged <= exclude_fold * thr).astype(np.float32)
+        new = _window_max(arr32, keep, bin_size, windows, floor,
+                          quiet_min_den=0.95 if robust_start else None)
+        done = np.allclose(new, lam, rtol=0.01, atol=1e-6)
+        lam = new
+        if done:
+            break
     return lam
 
 
@@ -308,6 +399,7 @@ class BackgroundModel:
         exclude_fold: float = 2.0,
         exclude_iters: int = 3,
         exclude_smooth_bp: Optional[int] = None,
+        robust_start: bool = False,
     ) -> "BackgroundModel":
         """Fit the background.
 
@@ -338,7 +430,8 @@ class BackgroundModel:
                 lam = local_lambda(c, ctrl.bin_size, windows, gmean,
                                    exclude_fold=exclude_fold,
                                    exclude_iters=exclude_iters,
-                                   exclude_smooth_bp=exclude_smooth_bp)
+                                   exclude_smooth_bp=exclude_smooth_bp,
+                                   robust_start=robust_start)
             else:
                 # No-control mode.  The treatment is the only background
                 # estimate available, so the windows MUST be substantially
@@ -348,7 +441,8 @@ class BackgroundModel:
                 lam = local_lambda(arr, treatment.bin_size, windows, gmean,
                                    exclude_fold=exclude_fold,
                                    exclude_iters=exclude_iters,
-                                   exclude_smooth_bp=exclude_smooth_bp)
+                                   exclude_smooth_bp=exclude_smooth_bp,
+                                   robust_start=robust_start)
             mu[chrom] = np.maximum(lam, min_mu).astype(np.float32)
 
         coef = None
@@ -357,8 +451,46 @@ class BackgroundModel:
 
         counts_all = np.concatenate([treatment.bins[c] for c in sorted(treatment.bins)])
         mu_all = np.concatenate([mu[c] for c in sorted(mu)])
-        a0, a1 = estimate_dispersion(counts_all, mu_all)
-        inflation = autocorrelation_inflation(counts_all, mu_all)
+        if robust_start and exclude_fold and exclude_fold > 0:
+            # The dispersion is a property of the background, so with the
+            # anchored estimate it is fitted on the bins the exclusion kept.
+            # Fitted on everything below the 95th percentile, as otherwise,
+            # the moderate enrichment the lower background now stands under
+            # is read as noise: GSE285245 H3K27me3 a0 went 0.0 -> 1.29, the
+            # HMM's weak and background states blurred, and a 23 kb block at
+            # 3x (Havcr2) was not entered.
+            ks = max(1, int(round((exclude_smooth_bp or exclusion_smoothing_bp(
+                treatment.bin_size, windows)) / treatment.bin_size)))
+            kept = []
+            for c in sorted(treatment.bins):
+                a = treatment.bins[c].astype(np.float32)
+                j = uniform_filter1d(a, size=ks, mode="nearest") if ks > 1 else a
+                kept.append(j <= exclude_fold * mu[c][: j.size])
+            kept = np.concatenate(kept)
+            if kept.sum() >= 10_000:
+                counts_bg, mu_bg = counts_all[kept], mu_all[kept]
+            else:
+                counts_bg, mu_bg = counts_all, mu_all
+        else:
+            counts_bg, mu_bg = counts_all, mu_all
+        # A few million bins settle the mean-dispersion trend and the lag-1
+        # inflation; fitting them on every bin of a 10 bp mouse genome (263M)
+        # cost minutes and ~12 GB of float64 temporaries and sort indices.
+        # The trend uses a strided subsample (adjacency irrelevant); the
+        # inflation needs contiguous bins, so it takes a central block.
+        n_all = counts_all.size
+        if counts_bg.size > _FIT_MAX_BINS:
+            step = int(np.ceil(counts_bg.size / _FIT_MAX_BINS))
+            c_fit, m_fit = counts_bg[::step], mu_bg[::step]
+        else:
+            c_fit, m_fit = counts_bg, mu_bg
+        if n_all > _FIT_MAX_BINS:
+            mid = (n_all - _FIT_MAX_BINS) // 2
+            c_blk, m_blk = counts_all[mid: mid + _FIT_MAX_BINS], mu_all[mid: mid + _FIT_MAX_BINS]
+        else:
+            c_blk, m_blk = counts_all, mu_all
+        a0, a1 = estimate_dispersion(c_fit, m_fit)
+        inflation = autocorrelation_inflation(c_blk, m_blk)
 
         return cls(
             mu=mu,
@@ -374,12 +506,13 @@ class BackgroundModel:
                 "bin_size": treatment.bin_size,
                 "is_count": treatment.is_count,
                 "exclude_fold": float(exclude_fold),
+                "robust_start": bool(robust_start),
                 # What fraction of the genome the background fit set aside as
                 # apparent signal.  A value near 0 means the exclusion did
                 # nothing; a value near 1 means it has eaten the background and
                 # the windows or the fold are wrong.
                 "excluded_fraction": float(
-                    (counts_all > exclude_fold * mu_all).mean()
+                    (c_fit > exclude_fold * m_fit).mean()
                 ) if exclude_fold > 0 else 0.0,
                 "exclude_smooth_bp": int(
                     exclude_smooth_bp

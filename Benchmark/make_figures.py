@@ -38,9 +38,16 @@ S2 = "#eb6834"   # orange - MACS
 S3 = "#1baf7a"   # aqua   - re-implemented baselines
 NEUTRAL = "#6f6e69"  # ablation: a reference, not a competitor
 
+S4 = "#8b5cf6"   # violet - SICER2 (real tool)
+S5 = "#c2410c"   # rust   - SEACR (real tool)
+S6 = "#0e7490"   # teal   - THOR (real tool, differential)
+
 FAMILY_STYLE = {
     "FlexPeak": (S1, "o"),
     "MACS": (S2, "s"),
+    "SICER2": (S4, "v"),
+    "SEACR": (S5, "P"),
+    "THOR": (S6, "X"),
     "baseline": (S3, "^"),
     "ablation": (NEUTRAL, "D"),
 }
@@ -73,12 +80,13 @@ plt.rcParams.update({
     "figure.dpi": 200,
 })
 
-DATASET_ORDER = ["narrow", "broad", "mixed", "lowqual"]
+DATASET_ORDER = ["narrow", "broad", "mixed", "lowqual", "sparse"]
 DATASET_LABEL = {
     "narrow": "narrow\n(focal peaks)",
     "broad": "broad\n(domains)",
     "mixed": "mixed\n(both)",
     "lowqual": "low quality\n(weak, noisy)",
+    "sparse": "sparse\n(CUT&RUN-like)",
     "null": "null\n(no signal)",
 }
 
@@ -172,7 +180,8 @@ def cell(rows, dataset, key, field):
 
 
 def _legend_handles(families=None):
-    names = {"FlexPeak": "FlexPeak", "MACS": "MACS2 / MACS3",
+    names = {"FlexPeak": "FlexPeak", "MACS": "MACS2 / MACS3", "SICER2": "SICER2",
+             "SEACR": "SEACR", "THOR": "THOR",
              "baseline": "re-implemented baseline", "ablation": "ablation"}
     return [plt.Line2D([], [], color=c, marker=m, linestyle="none",
                        markersize=11, markeredgecolor=SURFACE, label=names[f])

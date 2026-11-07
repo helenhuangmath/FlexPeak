@@ -15,11 +15,12 @@ from .segment.hmm import NBHMM, _runs, segment_chromosome
 from .segment.subpeak import DEFAULT_BANDWIDTHS, find_subpeaks
 from .signal.coverage import Coverage
 from .stats.nbtest import (
-    aggregate_nb_params, autocorrelation_length_bp, nb_neglog10_sf,
-    qvalue_from_neglog10p,
+    aggregate_nb_params, ar1_factor, autocorrelation_length_bp, nb_neglog10_sf,
+    qvalue_from_neglog10p, rho_from_inflation,
 )
 
-__all__ = ["CallParams", "call_peaks", "PRESETS"]
+__all__ = ["CallParams", "call_peaks", "PRESETS", "robust_start_enabled",
+           "weak_domain_window_bp"]
 
 
 @dataclass
@@ -32,8 +33,18 @@ class CallParams:
     posterior_cutoff: float = 0.5
     min_width: int = 100
     max_gap: int = 0
-    """Merge regions separated by <= max_gap bp.  0 disables (the HMM already
-    infers boundaries; this exists for compatibility, not as a tuning knob)."""
+    """Connect regions separated by <= max_gap bp *when the gap carries similar
+    enrichment* (see ``gap_fold_fraction``).  0 disables.  The quick scan
+    (``flexpeak.scan``) sets it from the sample's own inter-run gap
+    distribution; the HMM already infers boundaries, so this only joins the
+    pieces of one feature that a dip in coverage split."""
+    gap_fold_fraction: float = 0.5
+    """Two neighbouring regions within ``max_gap`` are merged only if the fold
+    enrichment of the gap between them is at least this fraction of the
+    weaker neighbour's fold (and at least ``min_fold``).  That is what keeps a
+    distance rule from fusing two features across genuine background -- the
+    SICER/epic2 failure mode -- while still connecting nearby similar
+    measurements.  <= 0 restores a plain distance merge."""
     min_fold: float = 1.2
     """Effect-size floor on a region's observed/expected fold.
 
@@ -114,6 +125,28 @@ class CallParams:
     how much of the window the feature fills.  0 restores the plain windowed
     mean (DESIGN 9.5 ablation)."""
     background_exclude_iters: int = 3
+    background_robust_start: Optional[bool] = None
+    """Start the background's signal exclusion from a running median instead
+    of the plain windowed mean (see ``local_lambda(robust_start=...)``).
+    None: on when every background window is >= ``DOMAIN_WINDOW_BP`` (the
+    domain-mark setting), where moderate enrichment across the window
+    otherwise becomes part of the background."""
+    weak_domain_bp: Optional[int] = None
+    """Window of the weak-domain pass, bp; 0 disables, None picks
+    max(10 kb, 2 x domain_min_width) when the background windows are
+    domain-scale (>= ``DOMAIN_WINDOW_BP``) and disables it otherwise.
+
+    The HMM decides state bin by bin at the segmentation scale, and a long,
+    low (1.5-2.5x) stretch full of dips drops back to background at every
+    dip: it comes out as scattered pieces or not at all.  This pass tests
+    sliding sums over
+    the window against the wide background with the same NB + AR(1) model
+    the region test uses, against the wide background, Bonferroni over
+    genome / window independent windows, and adds significant runs at
+    ``weak_domain_min_fold`` as candidate regions.  They then face what any
+    region faces: the region test and FDR, and -- holding focal peaks --
+    the residual test that dissolves a "domain" that is only its peaks."""
+    weak_domain_min_fold: float = 1.5
     background_exclude_smooth_bp: Optional[int] = None
     """Scale at which signal is judged before being held out of the background.
 
@@ -161,11 +194,104 @@ class CallParams:
     max_dwell: int = 100_000
     """Cap on that floor, in bp -- a degenerate autocorrelation estimate on a
     short or repetitive contig must not turn the chromosome into one region."""
+    focal_windows: Tuple[int, ...] = (1_000, 5_000, 10_000)
+    """MACS-style local windows for the focal pass (``focal_pass``).  Plain
+    local means (no signal exclusion) maxed with the wide background, so the
+    focal background rises to the local level inside a promoter cluster or a
+    domain and only the summits stand out -- which is how MACS keeps H3K4me3
+    peaks narrow, and what a wide-window background alone cannot do: with
+    150/750 kb windows the valleys between promoters sit far above
+    background and a whole cluster fused into one 40-85 kb region (measured
+    on GSE285245 H3K4me3 / H3K27ac at Havcr2 and Tcf7).  Without a control
+    the windows below 5 kb are dropped, as MACS drops its 1 kb window: a
+    1 kb plain mean of the treatment at a summit *is* the summit, every
+    peak reads as fold 1 and the cluster fuses again (measured)."""
+    focal_pass: bool = True
+    """Run a second, fine-scale segmentation against the focal background
+    whenever ``windows`` are all wider than ``focal_windows``.  Its regions
+    become the sub-peaks of the domains they fall in (tested against the
+    focal background, i.e. relative to the local level) and standalone
+    ``peak`` regions elsewhere; the scale-space sub-peak search is then
+    skipped.  Off, or when the windows already are the focal ones, the
+    scale-space search runs as before."""
+    focal_max_segment_bp: int = 500
+    """Cap on the focal pass's segmentation bin."""
+    focal_min_fold: float = 1.3
+    """Fold floor of a focal region over its local background (MACS's
+    ``--fe-cutoff`` idea; MACS's own default is 1.0): with deep coverage a
+    1.1x bump over the local mean is "significant", and that is not a
+    peak.  1.3 rather than 1.5 because the local mean includes the peak
+    itself, so a 2x summit over a plateau measures ~1.4x."""
+    focal_gap_bins: int = 2
+    """Significant focal bins separated by at most this many segmentation
+    bins are one region."""
+    focal_test_window_bp: Optional[int] = None
+    """Width of the sliding sum the focal test is run on, stepped at the
+    segmentation bin.  None: the focal feature scale, clipped to 200-1000 bp.
+    MACS's per-base pileup is a sum over the fragment length, and that sum
+    is where its power comes from; a single 25 bp bin of a normalised track
+    is so overdispersed (alpha 1-1.6 on GSE285245 bigWigs) that a 2.5x
+    summit is 1.5 SD and never significant, which left every promoter
+    cluster as one block."""
+    focal_scales: Tuple[int, ...] = ()
+    """Sliding-window widths (bp) the focal test is run at, finest first.
+
+    Empty: one window, ``focal_test_window_bp`` (or the focal feature scale
+    clipped to 200-1000 bp).  The quick scan sets a ladder from the mark's
+    own run-width distribution (``ScanRecommendation.focal_scales``): the
+    median bin-level run, the 90th percentile run, and for domain marks the
+    median run after 5 kb smoothing.  One window cannot serve a 200 bp
+    H3K9me3 spike and a 5 kb cluster: a 1 kb window dilutes the spike
+    ~3x, and a 200 bp window has no power on the cluster.  Each scale gets
+    its own background and dispersion; scales are then assembled fine to
+    coarse (see ``_assemble_scales``)."""
+    focal_background: str = "flank"
+    """Focal background at each scale.
+
+    ``"flank"``: MACS's local lambda with the tested window left out -- the
+    mean of the flanks over ``focal_flank_factors`` x the window (at least
+    ``focal_min_flank_bp``) on each side, excluding a guard of half a window
+    around it, max over the flank sizes, floored at the robust background
+    level (the median of the smoothed track).  Leaving the window out is
+    what lets a sub-peak inside a domain be tested against the domain
+    around it rather than against a mean it is part of; the median floor is
+    what stops a quiet neighbourhood from being judged against the genome
+    MEAN (measured at Pdcd1 H3K9me3: focal background 100/kb against a
+    true level of 5-15/kb, so a 10x spike read 1.2x).
+    ``"plain"``: the previous behaviour -- plain 10 kb mean (peak included)
+    maxed with the wide background (ablation)."""
+    domain_residual_share: float = 0.5
+    """A first-pass region holding focal peaks stands as a domain only if
+    the signal BETWEEN its peaks carries at least this share of its excess
+    over the wide background; otherwise it is reported as its peaks.  A
+    Polycomb or H3K9me3 domain is mostly between-peak territory; a promoter
+    cluster is mostly its summits.  0 disables (residual fold and p only)."""
+    focal_flank_factors: Tuple[float, ...] = (10.0, 50.0)
+    focal_min_flank_bp: int = 5_000
+    focal_floor_fraction: float = 0.5
+    """The focal background never drops below this fraction of the robust
+    background level (median of the smoothed track).  1.0 is MACS's rule
+    (local lambda never below the genome level); lower lets a quiet
+    neighbourhood be its own background.  0.5 chosen on pooled H3K9me3
+    chr1 against replicate support (spikes >= 4x pooled and >= 2x in >= 3
+    of 4 replicates): with clipped dispersion, recall 0.62 at 1.0, 0.81 at
+    0.5, 0.84 at 0.25; share of narrow calls with replicate support 0.99 /
+    0.97 / 0.94; simulated null 3 calls at all three."""
+    focal_dispersion: str = "clipped"
+    """How the window-sum dispersion is estimated on background windows:
+    ``"moments"`` (variance of the windows below the 95th percentile, per mean
+    group) or ``"clipped"`` (iteratively refitted with the windows the fit
+    itself calls enriched removed -- see ``_clipped_dispersion``)."""
+    focal_fdr: str = "pooled"
+    """``"pooled"``: one BH over every scale; ``"per_scale"``: each window
+    size its own family."""
 
     def to_dict(self) -> Dict:
         d = asdict(self)
         d["windows"] = list(self.windows)
         d["bandwidths"] = list(self.bandwidths)
+        d["focal_scales"] = list(self.focal_scales)
+        d["focal_flank_factors"] = list(self.focal_flank_factors)
         return d
 
     def replace(self, **kw) -> "CallParams":
@@ -183,7 +309,11 @@ PRESETS: Dict[str, Dict] = {
                     bandwidths=(150, 500, 1500), min_width=200, domain_min_width=3000),
     "h3k27ac": dict(bin_size=25, windows=(10_000, 50_000),
                     bandwidths=(150, 500, 1500, 5000), min_width=250, domain_min_width=3000),
-    "h3k27me3": dict(bin_size=100, windows=(200_000, 1_000_000),
+    # Broad-mark windows are 1 Mb / 5 Mb, not 200 kb / 1 Mb: measured on
+    # GSE285245 H3K27me3 (chr11) the weak Polycomb neighbourhood around Havcr2
+    # (2.4x over the chromosome background, several hundred kb wide) became
+    # its own background at 200 kb and was never called; at 1 Mb it is.
+    "h3k27me3": dict(bin_size=100, windows=(1_000_000, 5_000_000),
                      bandwidths=(500, 1500, 5000, 15000), min_width=500,
                      domain_min_width=5000, min_fold=1.2, posterior_cutoff=0.45),
     # No preset pins segment_bin_size, and that is a measured decision, not an
@@ -194,10 +324,10 @@ PRESETS: Dict[str, Dict] = {
     # segmentation bin cannot resolve a 300 bp peak.  The right scale is a
     # property of the library, not of the mark, so it is swept by the tuner
     # (see tune.default_grid) and settable per run with --segment-bin-size.
-    "h3k9me3": dict(bin_size=100, windows=(200_000, 1_000_000),
+    "h3k9me3": dict(bin_size=100, windows=(1_000_000, 5_000_000),
                     bandwidths=(500, 1500, 5000, 15000), min_width=300,
                     domain_min_width=5000, min_fold=1.2, posterior_cutoff=0.45),
-    "h3k36me3": dict(bin_size=100, windows=(100_000, 500_000),
+    "h3k36me3": dict(bin_size=100, windows=(1_000_000, 5_000_000),
                      bandwidths=(500, 1500, 5000), min_width=500,
                      domain_min_width=5000, min_fold=1.2),
     "atac": dict(bin_size=10, windows=(1000, 5000, 10000), bandwidths=(50, 150, 500),
@@ -296,6 +426,44 @@ def call_peaks(
     diagnostics["signal_scale_bp"] = int(scale_bp)
     diagnostics["segment_bin_size"] = int(factor * bs)
 
+    # The HMM's dispersion is measured at the scale the HMM works at: on the
+    # segmentation-bin sums, not derived from the per-bin trend.  A sparse
+    # pileup at 10-25 bp is zero-inflated and its per-bin trend degenerates
+    # (measured on a CUT&RUN CTCF replicate: a0 0, a1 at the 100 clip, so
+    # alpha = 100/mu, and 1.6 Gb "called"); the sums are not.  The same
+    # choice the focal test makes for its window sums.
+    seg_key = ("seg_dispersion", factor, params.background_model)
+    if seg_key not in cache:
+        from .background.nb import estimate_dispersion
+
+        cs, ms = [], []
+        for chrom in sorted(treatment.bins):
+            c = treatment.bins[chrom].astype(np.float64)
+            m = bg.mu[chrom].astype(np.float64)
+            n = min(c.size, m.size)
+            cs.append(_coarsen(c[:n], factor))
+            ms.append(_coarsen(m[:n], factor))
+        c_all, m_all = np.concatenate(cs), np.concatenate(ms)
+        if robust_start_enabled(params) and params.background_exclude_fold > 0:
+            # Background segmentation bins only, as the background's own
+            # dispersion is fitted with the anchored estimate (see
+            # BackgroundModel.fit): with the 95th-percentile trim the
+            # moderate enrichment widens the emissions until a 45 kb empty
+            # gap (Pdcd1 gene body, H3K27me3) no longer drops to background.
+            bgk = c_all <= params.background_exclude_fold * m_all
+            if bgk.sum() >= 2_000:
+                c_all, m_all = c_all[bgk], m_all[bgk]
+        if c_all.size > 4_000_000:
+            step = int(np.ceil(c_all.size / 4_000_000))
+            c_all, m_all = c_all[::step], m_all[::step]
+        cache[seg_key] = estimate_dispersion(c_all, m_all)
+    seg_a0, seg_a1 = cache[seg_key]
+    diagnostics["segment_dispersion"] = {"a0": float(seg_a0), "a1": float(seg_a1)}
+
+    weak_bp = weak_domain_window_bp(params)
+    genome_bp = int(sum(treatment.chrom_sizes.get(c, a.size * bs)
+                        for c, a in treatment.bins.items()))
+    diag_weak = 0
     for chrom in sorted(treatment.bins):
         counts = treatment.bins[chrom].astype(np.float64)
         mu = bg.mu[chrom].astype(np.float64)
@@ -319,7 +487,8 @@ def call_peaks(
         # indistinguishable exactly when the bins get coarse enough to be
         # useful.  Measured on H3K9me3, it made called territory *fall* from
         # 5.7% to 0.8% as the segmentation coarsened, when it should have risen.
-        alpha_seg = _aggregate_alpha(mu, alpha, factor, bg.autocorr_inflation)
+        alpha_seg = (np.maximum(seg_a0 + seg_a1 / np.maximum(mu_seg, 1e-9), 1e-8)
+                     if factor > 1 else alpha)
 
         if params.background_model == "poisson":
             alpha = np.full_like(mu, 1e-9)  # NB -> Poisson, for the ablation
@@ -349,7 +518,14 @@ def call_peaks(
             cache[key] = res
         posterior = res.posterior
         intervals = _runs(posterior >= params.posterior_cutoff, min_bins)
-        intervals = _merge_close(intervals, params.max_gap // bs if params.max_gap else 0)
+        intervals = _merge_similar(
+            intervals, params.max_gap // bs if params.max_gap else 0, counts, mu,
+            params.gap_fold_fraction, params.min_fold)
+        if weak_bp:
+            weak = _weak_domains(counts, mu, bg, bs, weak_bp, params, genome_bp)
+            diag_weak += len(weak)
+            if weak:
+                intervals = _union_intervals(intervals, weak)
         diagnostics["chroms"][chrom] = {
             "n_intervals": len(intervals),
             "multipliers": res.multipliers.tolist(),
@@ -371,13 +547,24 @@ def call_peaks(
         }
 
         chrom_len = treatment.chrom_sizes.get(chrom, counts.size * bs)
-        for b0, b1 in intervals:
-            region = _build_region(
-                chrom, b0, b1, counts, mu, alpha, res.posterior, bs, chrom_len,
-                params, bg.autocorr_inflation,
-            )
-            if region is not None:
-                regions.append(region)
+        regions.extend(_build_regions(
+            chrom, intervals, counts, mu, alpha, res.posterior, bs, chrom_len,
+            params, bg.autocorr_inflation,
+            skip_subpeaks=(params.focal_pass and bool(params.focal_windows)
+                           and bool(params.windows)
+                           and min(params.windows) > max(params.focal_windows)),
+        ))
+
+    diagnostics["weak_domain_bp"] = int(weak_bp)
+    diagnostics["n_weak_domain_candidates"] = int(diag_weak)
+
+    focal_ran = False
+    if params.focal_pass and params.focal_windows and params.windows and \
+            min(params.windows) > max(params.focal_windows):
+        regions, focal_diag = _focal_pass(treatment, control, params, bg, regions,
+                                          covariates, cache)
+        diagnostics["focal"] = focal_diag
+        focal_ran = True
 
     peaks = NestedPeakSet(
         regions,
@@ -398,7 +585,10 @@ def call_peaks(
         chrom_sizes=dict(treatment.chrom_sizes),
     )
 
-    _gate_domain_subpeaks(peaks, params)
+    if not focal_ran:
+        # Focal-pass sub-peaks are HMM-segmented, NB-tested regions in their
+        # own right; the robust-z gate exists for scale-space noise bumps.
+        _gate_domain_subpeaks(peaks, params)
     peaks = _apply_fdr(peaks, params)
     if blacklist:
         before = len(peaks)
@@ -417,7 +607,31 @@ def call_peaks(
 BACKGROUND_FIELDS = frozenset({
     "bin_size", "windows", "background_exclude_fold",
     "background_exclude_iters", "background_exclude_smooth_bp",
+    "background_robust_start",
 })
+
+
+DOMAIN_WINDOW_BP = 500_000
+"""Background windows at least this wide mark the domain-scale setting (the
+scan and presets use 1 Mb / 5 Mb for domain marks), where the anchored
+background and the weak-domain pass are on by default.  Not at 100-200 kb,
+the mixed-mark windows: measured on GSE285245 H3K27ac (165 / 823 kb) the
+anchored background and its background-only dispersion cost replicate
+support (0.92 -> 0.89) and recall (0.52 -> 0.49)."""
+
+
+def robust_start_enabled(params: "CallParams") -> bool:
+    if params.background_robust_start is not None:
+        return bool(params.background_robust_start)
+    return bool(params.windows) and min(params.windows) >= DOMAIN_WINDOW_BP
+
+
+def weak_domain_window_bp(params: "CallParams") -> int:
+    if params.weak_domain_bp is not None:
+        return max(0, int(params.weak_domain_bp))
+    if params.windows and min(params.windows) >= DOMAIN_WINDOW_BP:
+        return int(max(10_000, 2 * params.domain_min_width))
+    return 0
 
 
 def fit_background(treatment: Coverage, control: Optional[Coverage],
@@ -431,16 +645,22 @@ def fit_background(treatment: Coverage, control: Optional[Coverage],
         exclude_fold=params.background_exclude_fold,
         exclude_iters=params.background_exclude_iters,
         exclude_smooth_bp=params.background_exclude_smooth_bp,
+        robust_start=robust_start_enabled(params),
     )
 
 
 def _aggregate_alpha(mu: np.ndarray, alpha: np.ndarray, factor: int,
                      inflation: float = 1.0) -> np.ndarray:
-    """Dispersion of block sums of ``factor`` bins, from the per-bin trend."""
+    """Dispersion of block sums of ``factor`` bins, from the per-bin trend.
+
+    ``inflation`` is the background's asymptotic lag-1 factor; the factor
+    actually applied is the exact one for a sum of ``factor`` bins
+    (``ar1_factor``), which is far smaller for short blocks."""
     mu_seg = _coarsen(mu, factor)
     if factor <= 1:
-        return np.maximum(alpha * inflation, 1e-10)
-    var = mu_seg + max(inflation, 1.0) * _coarsen(alpha * mu * mu, factor)
+        return np.maximum(alpha, 1e-10)
+    f = float(ar1_factor(factor, rho_from_inflation(inflation)))
+    var = mu_seg + f * _coarsen(alpha * mu * mu, factor)
     return np.maximum((var - mu_seg) / np.maximum(mu_seg * mu_seg, 1e-12), 1e-10)
 
 
@@ -527,6 +747,574 @@ def _dwell_floor(scale_bp: float, bin_size: int, params: CallParams) -> float:
     return float(np.clip(1.0 - bin_size / scale, 0.0, 0.9999))
 
 
+def _focal_pass(treatment: Coverage, control, params: CallParams, bg_wide: BackgroundModel,
+                regions: List[Region], covariates, cache: Dict):
+    """Multi-scale sliding-window test against a local background per scale.
+
+    For every window width in ``focal_scales`` (finest first): sliding sums
+    stepped at a fine segmentation bin, tested (NB tail) against the
+    MACS-style local level with the window itself left out of its flanks
+    (``focal_background="flank"``), with the window dispersion fitted on the
+    sums separately inside and outside first-pass regions.  One BH over all
+    positions and scales.  Significant windows form intervals per scale;
+    ``_assemble_scales`` nests them fine to coarse.  Each resulting focal
+    region contributes its sub-peaks (or itself) to the first-pass region it
+    overlaps, or is reported as a standalone region with its sub-peaks.
+    """
+    bs = treatment.bin_size
+    # Scale of the focal features: autocorrelation of the high-passed signal.
+    if "focal_scale_bp" not in cache:
+        k_hp = max(1, int(round(20_000 / bs)))
+        lens = []
+        for arr in treatment.bins.values():
+            if arr.size < 1000:
+                continue
+            x = arr.astype(np.float64)
+            hp = x - uniform_filter1d(x, size=k_hp, mode="nearest") if k_hp < x.size else x
+            lens.append(autocorrelation_length_bp(hp, bs, max_lag_bp=20_000))
+        cache["focal_scale_bp"] = int(max(np.percentile(lens, 75), bs)) if lens else bs
+    scale_bp = cache["focal_scale_bp"]
+    seg = int(np.clip((scale_bp // 8 // bs) * bs, bs, params.focal_max_segment_bp))
+    seg = max(seg, (int(params.min_segment_bin_bp) // bs) * bs, bs)
+    raw_scales = (tuple(int(w) for w in params.focal_scales) if params.focal_scales else
+                  ((int(params.focal_test_window_bp) if params.focal_test_window_bp
+                    else int(np.clip(scale_bp, 200, 1000))),))
+    # The segmentation bin must resolve the finest window: at most half of it.
+    seg = int(min(seg, max(bs, (min(raw_scales) // 2 // bs) * bs)))
+    factor = max(1, seg // bs)
+    seg = factor * bs
+    scales: List[int] = []
+    for w in sorted(raw_scales):
+        w = int(max(seg, round(w / seg) * seg))
+        if w not in scales:
+            scales.append(w)
+    min_bins = max(1, params.min_width // bs)
+    mode = params.focal_background
+    if mode not in ("flank", "plain"):
+        raise ValueError(f"focal_background must be 'flank' or 'plain', got {mode!r}")
+    diag = {"scales_bp": scales, "scale_bp": int(scale_bp), "segment_bin_size": int(seg),
+            "background": mode,
+            "test": "NB tail of sliding sums at each scale, pooled BH over scales and positions"}
+
+    plain_mu = None
+    if mode == "plain":
+        # The previous focal background: plain local means (peak included)
+        # maxed with the wide background.  Kept as an ablation.
+        windows = tuple(sorted(set(params.focal_windows)))
+        if control is None:
+            windows = tuple(w for w in windows if w >= 10_000) or (max(windows),)
+        bg_local = BackgroundModel.fit(treatment, control=control, windows=windows,
+                                       covariates=covariates, exclude_fold=0.0)
+        plain_mu = {c: np.maximum(bg_local.mu[c][: bg_wide.mu[c].size],
+                                  bg_wide.mu[c][: bg_local.mu[c].size]) for c in bg_wide.mu}
+        diag["windows"] = list(windows)
+
+    chroms = sorted(treatment.bins)
+    # First-pass territory, at segmentation resolution: the dispersion of a
+    # window inside a domain is the domain's texture, outside it the
+    # background's, and one fit over both mixes them (measured: window alpha
+    # 0.25 on H3K27me3, a sub-peak then needed ~6x over its domain).
+    by_chrom_regions: Dict[str, List[Region]] = {}
+    for r in regions:
+        by_chrom_regions.setdefault(r.chrom, []).append(r)
+
+    per = {}  # (chrom, scale) -> dict(c_w, mu_w, inside, mean_bin)
+    for chrom in chroms:
+        counts = treatment.bins[chrom].astype(np.float64)
+        m = min(counts.size, bg_wide.mu[chrom].size)
+        counts = counts[:m]
+        c_seg = _coarsen(counts, factor)
+        n = c_seg.size
+        inside = np.zeros(n, dtype=bool)
+        for r in by_chrom_regions.get(chrom, []):
+            inside[r.start // seg: -(-r.end // seg)] = True
+        cum = np.concatenate([[0.0], np.cumsum(c_seg)])
+        idx = np.arange(n)
+        floor = _robust_floor(c_seg, max(1, int(round(min(scales) / seg))),
+                              max(1, int(round(max(params.focal_windows or (10_000,)) / seg))))
+        wide_seg = (_coarsen(bg_wide.mu[chrom][:m].astype(np.float64), factor)
+                    if (control is not None and mode == "flank") else None)
+        plain_seg = (_coarsen(plain_mu[chrom][:m].astype(np.float64), factor)
+                     if plain_mu is not None else None)
+        for w in scales:
+            k = max(1, w // seg)
+            lo0 = idx - k // 2
+            lo, hi = np.clip(lo0, 0, n), np.clip(lo0 + k, 0, n)
+            c_w = cum[hi] - cum[lo]
+            n_w = np.maximum(hi - lo, 1)
+            if mode == "plain":
+                mean_bin = (np.concatenate([[0.0], np.cumsum(plain_seg)]))
+                mu_w = mean_bin[hi] - mean_bin[lo]
+                mean_bin = plain_seg
+            else:
+                g = max(1, k // 2)
+                ex_lo, ex_hi = np.clip(lo0 - g, 0, n), np.clip(lo0 + k + g, 0, n)
+                ex_s, ex_n = cum[ex_hi] - cum[ex_lo], ex_hi - ex_lo
+                mean_bin = np.full(n, floor * float(params.focal_floor_fraction))
+                for fct in params.focal_flank_factors:
+                    L = max(int(round(fct * k)), int(round(params.focal_min_flank_bp / seg)), 1)
+                    o_lo, o_hi = np.clip(lo0 - g - L, 0, n), np.clip(lo0 + k + g + L, 0, n)
+                    fl_n = (o_hi - o_lo) - ex_n
+                    fl = np.where(fl_n > 0, (cum[o_hi] - cum[o_lo] - ex_s) / np.maximum(fl_n, 1), 0.0)
+                    np.maximum(mean_bin, fl, out=mean_bin)
+                if wide_seg is not None:
+                    # With a control the wide model is the control's own
+                    # level, which the flanks of the treatment cannot see.
+                    np.maximum(mean_bin, wide_seg, out=mean_bin)
+                mu_w = mean_bin * n_w
+            per[(chrom, w)] = dict(c_w=c_w, mu_w=np.maximum(mu_w, 1e-9), inside=inside,
+                                   mean_bin=mean_bin)
+
+    # Dispersion of the window sums, per scale, measured on the sums of
+    # windows OUTSIDE first-pass regions.  Inside them the windows are the
+    # signal: a fit there measured the peaks, not the noise (H3K4me3: alpha
+    # ~2 + 93/mu inside against 0.03 + 5/mu outside, and no promoter summit
+    # in a first-pass region was ever significant).
+    from .background.nb import estimate_dispersion
+
+    disp = {}
+    nlps = {}
+    for w in scales:
+        cs = np.concatenate([per[(c, w)]["c_w"][~per[(c, w)]["inside"]] for c in chroms])
+        ms = np.concatenate([per[(c, w)]["mu_w"][~per[(c, w)]["inside"]] for c in chroms])
+        if cs.size < 2_000:
+            cs = np.concatenate([per[(c, w)]["c_w"] for c in chroms])
+            ms = np.concatenate([per[(c, w)]["mu_w"] for c in chroms])
+        if cs.size > 4_000_000:
+            step = int(np.ceil(cs.size / 4_000_000))
+            cs, ms = cs[::step], ms[::step]
+        fit = (_clipped_dispersion(cs, ms) if params.focal_dispersion == "clipped"
+               else estimate_dispersion(cs, ms))
+        if params.background_model == "poisson":
+            fit = (1e-9, 0.0)
+        disp[w] = [float(fit[0]), float(fit[1])]
+        for c in chroms:
+            d = per[(c, w)]
+            nlps[(c, w)] = nb_neglog10_sf(d["c_w"], d["mu_w"],
+                                          np.maximum(fit[0] + fit[1] / d["mu_w"], 1e-10))
+    diag["window_dispersion"] = {str(w): v for w, v in disp.items()}
+
+    # FDR over the tests actually made.  Windows stepped at the segmentation
+    # bin overlap: a 3.6 kb window stepped at 100 bp is the same test 36
+    # times, and BH over every step counted it 36 times.  So the BH cut is
+    # set on non-overlapping windows (genome / window tests per scale, all
+    # scales pooled) and then applied to every position.
+    keys = [(c, w) for w in scales for c in chroms]
+    cut = -np.log10(params.qvalue) if params.qvalue > 0 else 0.0
+    families = ([[k for k in keys if k[1] == w] for w in scales]
+                if params.focal_fdr == "per_scale" else [keys])
+    p_cuts = {}
+    for fam in families:
+        sampled = np.concatenate([nlps[(c, w)][::max(1, w // seg)] for (c, w) in fam])
+        q_s = qvalue_from_neglog10p(sampled)
+        passing = sampled[q_s >= cut]
+        pc_ = float(passing.min()) if passing.size else float("inf")
+        for k in fam:
+            p_cuts[k] = pc_
+        del sampled, q_s, passing
+    diag["p_cut_neglog10"] = {str(w): p_cuts[(chroms[0], w)] for w in scales}
+    sig = {}
+    dbg_loci = cache.get("focal_debug") or []
+    dbg_out = []
+    for k in keys:
+        d = per[k]
+        nl = nlps[k]
+        # Significant and over the fold floor of the local level.
+        p_cut = p_cuts[k]
+        sig[k] = (nl >= p_cut) & (d["c_w"] >= params.focal_min_fold * d["mu_w"])
+        for (c, s0, e0) in dbg_loci:
+            if c == k[0]:
+                j0, j1 = s0 // seg, min(nl.size, -(-e0 // seg))
+                dbg_out.append({"chrom": c, "scale": k[1], "start_bin": j0, "seg": seg,
+                                "p_cut": p_cut,
+                                "c_w": d["c_w"][j0:j1].copy(), "mu_w": d["mu_w"][j0:j1].copy(),
+                                "inside": d["inside"][j0:j1].copy(),
+                                "nlp": nl[j0:j1].copy(), "sig": sig[k][j0:j1].copy()})
+    if dbg_loci:
+        cache["focal_debug_out"] = dbg_out
+
+    focal: List[Region] = []
+    n_per_scale = {w: 0 for w in scales}
+    n_parents = 0
+    for chrom in chroms:
+        counts = treatment.bins[chrom].astype(np.float64)
+        m = min(counts.size, bg_wide.mu[chrom].size)
+        counts = counts[:m]
+        chrom_len = treatment.chrom_sizes.get(chrom, counts.size * bs)
+        pc = np.concatenate([[0.0], np.cumsum(counts)])
+        layers = []
+        for w in scales:
+            k = max(1, w // seg)
+            n_seg = sig[(chrom, w)].size
+            mu_fine = np.repeat(per[(chrom, w)]["mean_bin"] / factor, factor)[:m]
+            ivs = _runs(sig[(chrom, w)], 1)
+            # A run of significant window CENTRES means the windows around
+            # them are enriched: report the footprint (centres +- half a
+            # window), trimmed at each end to the bins above the local level.
+            # The centres alone made a 200 bp hit one 100 bp bin, which the
+            # min_width filter then dropped.
+            ivs = [(max(0, a - k // 2), min(n_seg, b - k // 2 + k)) for a, b in ivs]
+            ivs = _merge_close(ivs, params.focal_gap_bins)
+            ivs = [_trim_to_level(a * factor, min(b * factor, m), counts, mu_fine)
+                   for a, b in ivs]
+            ivs = [(a, b) for a, b in ivs if b - a >= min_bins]
+            n_per_scale[w] += len(ivs)
+            layers.append((w, ivs, mu_fine, disp[w]))
+        nodes, n_par = _assemble_scales(layers, pc, params.focal_min_fold)
+        n_parents += n_par
+        for (a, b, li), leaves in nodes:
+            w, _, mu_fine, fit = layers[li]
+            reg = _focal_region(chrom, a, b, counts, mu_fine, fit, bs, chrom_len, params)
+            if reg is None:
+                continue
+            for (la, lb, lj) in leaves:
+                sp = _focal_region(chrom, la, lb, counts, layers[lj][2], layers[lj][3], bs,
+                                   chrom_len, params)
+                if sp is not None:
+                    reg.subpeaks.append(_as_subpeak(sp, treatment.bins[chrom], bs))
+            focal.append(reg)
+    diag["n_per_scale"] = {str(w): int(v) for w, v in n_per_scale.items()}
+    diag["n_scale_parents"] = int(n_parents)
+    diag["n_focal"] = len(focal)
+
+    # Attach to first-pass regions, or keep as standalone peaks.  A focal
+    # region with its own finer sub-peaks contributes those; one without
+    # contributes itself.
+    by_chrom: Dict[str, List[Region]] = {}
+    for r in regions:
+        by_chrom.setdefault(r.chrom, []).append(r)
+    for lst in by_chrom.values():
+        lst.sort(key=lambda r: r.start)
+    starts_by = {c: np.array([r.start for r in lst]) for c, lst in by_chrom.items()}
+    out = list(regions)
+    n_attached = 0
+    attached: Dict[int, List[Region]] = {}
+    for f in focal:
+        parents = by_chrom.get(f.chrom, [])
+        parent = None
+        if parents:
+            i = int(np.searchsorted(starts_by[f.chrom], f.start, side="right")) - 1
+            for j in (i, i + 1):
+                if 0 <= j < len(parents) and parents[j].end > f.start and parents[j].start < f.end:
+                    parent = parents[j]
+                    break
+        if parent is None:
+            out.append(f)
+            continue
+        pieces = f.subpeaks or [_as_subpeak(f, treatment.bins[f.chrom], bs)]
+        added = []
+        for sp in pieces:
+            s0, e0 = max(sp.start, parent.start), min(sp.end, parent.end)
+            if e0 <= s0:
+                continue
+            summit = int(min(max(sp.summit, s0), e0 - 1))
+            parent.subpeaks.append(SubPeak(
+                chrom=sp.chrom, start=int(s0), end=int(e0), summit=summit, score=sp.score,
+                neg_log10_p=sp.neg_log10_p, fold_enrichment=sp.fold_enrichment,
+                persistence=0))
+            added.append((s0, e0))
+        if not added:
+            out.append(f)
+            continue
+        attached.setdefault(id(parent), []).append((f, added))
+        n_attached += 1
+
+    # A region that holds focal peaks is a claim about the level BETWEEN
+    # them: the domain must stand on its residual, with the focal bins taken
+    # out.  Otherwise a run of narrow peaks over a slightly drifted
+    # background is reported as one "domain" whose fold is entirely the
+    # peaks' (measured on the simulated narrow set with the h3k27me3 preset:
+    # 79 kb regions at 1.5x average fold, 0.17 precision).  A region whose
+    # residual fails the same fold and p-value cut as any region is
+    # dissolved into its focal peaks, which are reported standalone.  The
+    # residual is judged against the WIDE background: the domain's claim is
+    # enrichment over the genome, and against the local focal level (which
+    # inside a domain is the domain itself) every domain failed (measured:
+    # 115 of 174 H3K9me3 domains holding focal peaks dissolved on chr1+chr11).
+    cut = -np.log10(params.qvalue) if params.qvalue > 0 else 0.0
+    rho = rho_from_inflation(bg_wide.autocorr_inflation)
+    n_dissolved = 0
+    kept: List[Region] = []
+    for r in out:
+        fs = attached.get(id(r))
+        if not fs:
+            kept.append(r)
+            continue
+        # Slices only: a whole-chromosome float copy per region was most of
+        # the run once thousands of regions held focal peaks (H3K4me3: 117 s
+        # -> 484 s).
+        arr_c, arr_m = treatment.bins[r.chrom], bg_wide.mu[r.chrom]
+        m = min(arr_c.size, arr_m.size)
+        b0, b1 = r.start // bs, min(m, -(-r.end // bs))
+        c_all = arr_c[b0:b1].astype(np.float64)
+        m_all = arr_m[b0:b1].astype(np.float64)
+        # Only the leaf sub-peaks come out of the residual: a coarse focal
+        # parent (a sub-domain) is territory of the domain, not a peak in it.
+        mask = np.ones(max(b1 - b0, 0), dtype=bool)
+        for _f, pcs in fs:
+            for ps, pe in pcs:
+                mask[max(ps // bs, b0) - b0: max(min(-(-pe // bs), b1) - b0, 0)] = False
+        n_res = int(mask.sum())
+        ok = n_res > 0
+        if ok:
+            c_r, m_r = c_all[mask], m_all[mask]
+            a_r = bg_wide.alpha(m_r) if params.background_model != "poisson" else np.full_like(m_r, 1e-9)
+            obs, exp = float(c_r.sum()), float(max(m_r.sum(), 1e-9))
+            var = float(ar1_factor(n_res, rho)) * (exp + float((a_r * m_r * m_r).sum()))
+            a_eff = max((var - exp) / (exp * exp), 1e-10)
+            nlp = float(nb_neglog10_sf(np.array([obs]), np.array([exp]), np.array([a_eff]))[0])
+            ok = obs / exp >= params.min_fold and nlp >= cut
+            if ok and params.domain_residual_share > 0:
+                # ... and the between-peak level must carry its share of the
+                # region's excess.  A promoter cluster's shoulders are
+                # enriched over a wide background, but the region is its
+                # peaks (H3K4me3 at Havcr2: 5-17 kb "domains" whose excess
+                # sat almost entirely in the summits).
+                tot_obs = float(c_all.sum())
+                tot_exp = float(m_all.sum())
+                excess = tot_obs - tot_exp
+                ok = excess <= 0 or (obs - exp) >= params.domain_residual_share * excess
+        if ok:
+            kept.append(r)
+        else:
+            kept.extend(f for f, _ in fs)
+            n_dissolved += 1
+    out = kept
+    for r in out:
+        r.subpeaks.sort(key=lambda sp: sp.start)
+    diag["n_attached"] = n_attached
+    diag["n_standalone"] = len(focal) - n_attached
+    diag["n_dissolved"] = n_dissolved
+    out.sort(key=lambda r: (r.chrom, r.start))
+    return out, diag
+
+
+def _clipped_dispersion(counts: np.ndarray, mu: np.ndarray, clip_neglog10p: float = 2.0,
+                        n_iter: int = 6) -> Tuple[float, float]:
+    """``(a0, a1)`` fitted on background windows with real peaks removed.
+
+    The moment fit trims the top 5% of raw sums, which is not the same as
+    removing the windows that are enriched for their mean.  On a mark whose
+    "background" holds thousands of real narrow peaks that inflates the
+    dispersion until those very peaks cannot pass: measured on pooled
+    H3K9me3 chr1, 83% of the spikes at >= 4x their flanks were >= 2x in at
+    least 3 of the 4 replicates (random background maxima: 0%), yet a0 came
+    out at 0.11 and they scored p ~ 1e-3.  So: fit, drop the windows the
+    fit itself calls enriched at p < 10**-clip_neglog10p, refit, repeat to
+    convergence.  Clipping 1% of a true null tail costs a few percent of
+    variance; the simulated null set is the check on that.
+    """
+    from .background.nb import estimate_dispersion
+
+    c = np.asarray(counts, dtype=np.float64)
+    m = np.asarray(mu, dtype=np.float64)
+    fit = estimate_dispersion(c, m)
+    for _ in range(n_iter):
+        nl = nb_neglog10_sf(c, m, np.maximum(fit[0] + fit[1] / m, 1e-10))
+        keep = nl < clip_neglog10p
+        if keep.sum() < 1000:
+            break
+        new = estimate_dispersion(c[keep], m[keep], background_quantile=1.0)
+        done = abs(new[0] - fit[0]) <= 0.01 * max(fit[0], 1e-6) and \
+            abs(new[1] - fit[1]) <= 0.01 * max(fit[1], 1e-6)
+        fit = new
+        if done:
+            break
+    return fit
+
+
+def _robust_floor(x: np.ndarray, k0: int, cap: int) -> float:
+    """Background level of a track, per bin: the median of the track smoothed
+    over ``k0`` bins, doubling the smoothing until the median is non-zero
+    (sparse tracks), capped at ``cap`` bins; never above the mean.  The same
+    statistic ``local_lambda`` floors the wide background with."""
+    x = np.asarray(x, dtype=np.float64)
+    if x.size == 0:
+        return 1e-9
+    k = max(1, int(k0))
+    sm = uniform_filter1d(x, size=k, mode="nearest") if k > 1 else x
+    while float(np.median(sm)) <= 0.0 and k < cap:
+        k = min(k * 2, cap)
+        sm = uniform_filter1d(x, size=k, mode="nearest")
+    return float(max(min(float(np.median(sm)), float(x.mean())), 1e-9))
+
+
+def _assemble_scales(layers, pc: np.ndarray, min_fold: float):
+    """Nest the significant intervals of each scale, fine to coarse.
+
+    ``layers`` is ``[(window_bp, intervals, mu_fine), ...]`` finest first,
+    intervals in fine bins.  An interval at a coarser scale that overlaps
+    nothing finer is new territory (a feature only the wider window has
+    power for).  One that does overlap finer intervals becomes their parent
+    only if its *residual* -- its bins outside those finer intervals --
+    is still at ``min_fold`` over its own scale's local level: then it is a
+    cluster or sub-domain the fine peaks sit in.  Otherwise the fine peaks
+    explain it and it is dropped, which is what keeps a 3 kb window around
+    a 200 bp spike from widening the spike to 3 kb.
+
+    Returns ``([((start, end, layer), leaves), ...], n_parents)`` where
+    ``leaves`` are ``(start, end, layer)`` sub-intervals (empty when the node
+    is a single-scale interval).
+    """
+    tops: List[list] = []  # [start, end, layer, leaves]
+    n_parents = 0
+    for li, (w, ivs, mu_fine, _fit) in enumerate(layers):
+        if not ivs:
+            continue
+        pm = np.concatenate([[0.0], np.cumsum(mu_fine)])
+        if not tops:
+            tops = [[a, b, li, []] for a, b in ivs]
+            continue
+        tops.sort(key=lambda t: t[0])
+        t_start = np.array([t[0] for t in tops])
+        t_end = np.array([t[1] for t in tops])
+        claimed = np.zeros(len(tops), dtype=bool)
+        new: List[list] = []
+        for a, b in ivs:
+            lo = int(np.searchsorted(t_end, a, side="right"))
+            hi = int(np.searchsorted(t_start, b, side="left"))
+            ov = [j for j in range(lo, hi) if not claimed[j]]
+            if not ov:
+                if lo >= hi:
+                    new.append([a, b, li, []])
+                continue
+            obs = pc[b] - pc[a]
+            exp = pm[b] - pm[a]
+            for j in ov:
+                s0, e0 = max(a, tops[j][0]), min(b, tops[j][1])
+                obs -= pc[e0] - pc[s0]
+                exp -= pm[e0] - pm[s0]
+            if exp > 0 and obs / exp >= min_fold:
+                leaves = []
+                for j in ov:
+                    leaves.extend(tops[j][3] or [(tops[j][0], tops[j][1], tops[j][2])])
+                    claimed[j] = True
+                s = min(a, min(tops[j][0] for j in ov))
+                e = max(b, max(tops[j][1] for j in ov))
+                new.append([s, e, li, leaves])
+                n_parents += 1
+        tops = [t for j, t in enumerate(tops) if not claimed[j]] + new
+        tops = _merge_overlapping_nodes(tops)
+    tops.sort(key=lambda t: t[0])
+    return [((t[0], t[1], t[2]), t[3]) for t in tops], n_parents
+
+
+def _merge_overlapping_nodes(tops: List[list]) -> List[list]:
+    """Two parents of one layer can share an edge with the same finer node;
+    union them so the output never holds overlapping regions."""
+    tops = sorted(tops, key=lambda t: t[0])
+    out: List[list] = []
+    for t in tops:
+        if out and t[0] < out[-1][1]:
+            p = out[-1]
+            lp = p[3] or [(p[0], p[1], p[2])]
+            lt = t[3] or [(t[0], t[1], t[2])]
+            out[-1] = [p[0], max(p[1], t[1]), max(p[2], t[2]), sorted(set(lp + lt))]
+        else:
+            out.append(t)
+    return out
+
+
+def _focal_region(chrom, b0, b1, counts, mu, fit, bin_size, chrom_len,
+                  params: CallParams) -> Optional[Region]:
+    """Region statistics for one focal interval (fine bins) against its own
+    scale's local level, with the dispersion of that scale's window sums
+    (``fit`` = (a0, a1), alpha = a0 + a1 / expected sum) -- the same model
+    that detected it.  Re-testing with the per-bin trend and an AR(1)
+    inflation undid the window test: a 200 bp H3K9me3 spike at 3.6x passed
+    as a window and failed as a region.  None when it fails the focal fold
+    floor."""
+    obs = float(counts[b0:b1].sum())
+    m = mu[b0:b1]
+    exp = float(m.sum())
+    if exp <= 0 or obs / exp < params.focal_min_fold:
+        return None
+    start, end = min(b0 * bin_size, chrom_len), min(b1 * bin_size, chrom_len)
+    if end <= start:
+        return None
+    a_eff = max(float(fit[0]) + float(fit[1]) / exp, 1e-10)
+    nlp = float(nb_neglog10_sf(np.array([obs]), np.array([exp]), np.array([a_eff]))[0])
+    width = end - start
+    return Region(chrom=chrom, start=int(start), end=int(end),
+                  kind="domain" if width >= params.domain_min_width else "peak",
+                  score=obs, neg_log10_p=nlp, fold_enrichment=obs / exp,
+                  mean_posterior=1.0, source="focal")
+
+
+def _trim_to_level(a: int, b: int, counts: np.ndarray, mu: np.ndarray) -> Tuple[int, int]:
+    """Shrink [a, b) from both ends past bins at or below the local level."""
+    above = np.flatnonzero(counts[a:b] > mu[a:b])
+    if above.size == 0:
+        return a, b
+    return a + int(above[0]), a + int(above[-1]) + 1
+
+
+def _as_subpeak(r: Region, arr: np.ndarray, bin_size: int) -> SubPeak:
+    b0 = r.start // bin_size
+    b1 = max(b0 + 1, -(-r.end // bin_size))
+    summit = (b0 + int(np.argmax(arr[b0:b1]))) * bin_size + bin_size // 2
+    summit = int(min(max(summit, r.start), r.end - 1))
+    return SubPeak(chrom=r.chrom, start=r.start, end=r.end, summit=summit, score=r.score,
+                   neg_log10_p=r.neg_log10_p, fold_enrichment=r.fold_enrichment,
+                   persistence=0)
+
+
+def _build_regions(chrom, intervals, counts, mu, alpha, posterior, bin_size,
+                   chrom_len, params: CallParams, inflation: float = 1.0,
+                   skip_subpeaks: bool = False) -> List[Region]:
+    """Every region of a chromosome in one pass: prefix sums for the
+    aggregates and a single vectorised NB test.
+
+    The per-region version (``_build_region``) costs a SciPy call per region;
+    a punctate mark has tens of thousands of regions per chromosome and the
+    tuning sweep builds them eight times over, which on a CUT&RUN CTCF
+    replicate at 10 bp took longer than 30 minutes for one chromosome.
+    Same arithmetic as ``aggregate_nb_params`` with ``inflation``.
+    """
+    if not intervals:
+        return []
+    iv = np.asarray(intervals, dtype=np.int64).reshape(-1, 2)
+    b0, b1 = iv[:, 0], iv[:, 1]
+    pc = np.concatenate([[0.0], np.cumsum(counts, dtype=np.float64)])
+    pm = np.concatenate([[0.0], np.cumsum(mu, dtype=np.float64)])
+    pv = np.concatenate([[0.0], np.cumsum(np.asarray(alpha, dtype=np.float64) * mu * mu,
+                                          dtype=np.float64)])
+    pp = np.concatenate([[0.0], np.cumsum(posterior, dtype=np.float64)])
+    obs = pc[b1] - pc[b0]
+    exp = pm[b1] - pm[b0]
+    ok = exp > 0
+    exp_safe = np.where(ok, exp, 1.0)
+    fold = np.where(ok, obs / exp_safe, 0.0)
+    ok &= fold >= params.min_fold
+    start = np.minimum(b0 * bin_size, chrom_len)
+    end = np.minimum(b1 * bin_size, chrom_len)
+    ok &= end > start
+    if not ok.any():
+        return []
+    f = ar1_factor(b1 - b0, rho_from_inflation(inflation))
+    var = f * (exp_safe + pv[b1] - pv[b0])
+    a_eff = np.maximum((var - exp_safe) / (exp_safe * exp_safe), 1e-10)
+    nlp = nb_neglog10_sf(obs, exp_safe, a_eff)
+    mean_post = (pp[b1] - pp[b0]) / np.maximum(b1 - b0, 1)
+
+    out: List[Region] = []
+    for i in np.flatnonzero(ok):
+        width = int(end[i] - start[i])
+        region = Region(
+            chrom=chrom, start=int(start[i]), end=int(end[i]),
+            kind="domain" if width >= params.domain_min_width else "peak",
+            score=float(obs[i]), neg_log10_p=float(nlp[i]), fold_enrichment=float(fold[i]),
+            mean_posterior=float(mean_post[i]),
+        )
+        if params.call_subpeaks and not skip_subpeaks:
+            region.subpeaks = _call_subpeaks(
+                chrom, int(b0[i]), int(b1[i]), counts, mu, alpha, bin_size, chrom_len,
+                params, inflation,
+            )
+        out.append(region)
+    return out
+
+
 def _build_region(chrom, b0, b1, counts, mu, alpha, posterior, bin_size,
                   chrom_len, params: CallParams, inflation: float = 1.0) -> Optional[Region]:
     obs = float(counts[b0:b1].sum())
@@ -540,7 +1328,7 @@ def _build_region(chrom, b0, b1, counts, mu, alpha, posterior, bin_size,
     # Region-level test on the aggregate.  The dispersion of a SUM of bins is
     # not the per-bin dispersion -- see aggregate_nb_params.
     mu_tot, a_region = aggregate_nb_params(
-        mu[b0:b1], alpha[b0:b1], inflation=inflation)
+        mu[b0:b1], alpha[b0:b1], rho=rho_from_inflation(inflation))
     nlp = float(nb_neglog10_sf(np.array([obs]), np.array([mu_tot]), np.array([a_region]))[0])
 
     start = min(b0 * bin_size, chrom_len)
@@ -575,15 +1363,18 @@ def _call_subpeaks(chrom, b0, b1, counts, mu, alpha, bin_size, chrom_len,
         return []
 
     # Inside a domain the reference level is the domain, not the genome.
+    # Everything below works on slices: a whole-chromosome product or copy
+    # per region made this O(regions x chromosome) -- 11 ms per region on a
+    # 10 bp chromosome, 15 minutes for one CUT&RUN CTCF replicate.
     is_domain = (b1 - b0) * bin_size >= params.domain_min_width
+    level = 1.0
     if params.subpeak_vs_domain and is_domain:
         k = max(1, int(1000 / bin_size))
         local = (uniform_filter1d(counts[b0:b1], k, mode="nearest")
                  / np.maximum(uniform_filter1d(mu[b0:b1], k, mode="nearest"), 1e-9))
         level = max(1.0, float(np.median(local)))
-        mu = mu * level
         inflation = 1.0
-    seg_bg = mu[lo:hi]
+    seg_bg = mu[lo:hi] * level if level != 1.0 else mu[lo:hi]
 
     maxima = find_subpeaks(
         seg, bin_size, background=seg_bg,
@@ -608,15 +1399,17 @@ def _call_subpeaks(chrom, b0, b1, counts, mu, alpha, bin_size, chrom_len,
     # one call at a time was ~90% of the whole call.  Same arithmetic as
     # aggregate_nb_params, applied to all candidates at once.
     def _prefix(a):
-        return np.concatenate([[0.0], np.cumsum(a[b0:b1], dtype=np.float64)])
+        return np.concatenate([[0.0], np.cumsum(a, dtype=np.float64)])
 
-    pc, pm = _prefix(counts), _prefix(mu)
-    pv = _prefix(np.asarray(alpha, dtype=np.float64) * mu * mu)
+    mu_r = mu[b0:b1] * level if level != 1.0 else mu[b0:b1]
+    pc, pm = _prefix(counts[b0:b1]), _prefix(mu_r)
+    pv = _prefix(np.asarray(alpha[b0:b1], dtype=np.float64) * mu_r * mu_r)
     obs = pc[s1] - pc[s0]
     exp = pm[s1] - pm[s0]
     ok = exp > 0
     exp_safe = np.where(ok, exp, 1.0)
-    var = (inflation if inflation is not None else 1.0) * (exp_safe + pv[s1] - pv[s0])
+    f = ar1_factor(s1 - s0, rho_from_inflation(inflation if inflation is not None else 1.0))
+    var = f * (exp_safe + pv[s1] - pv[s0])
     a_eff = np.maximum((var - exp_safe) / (exp_safe * exp_safe), 1e-10)
     nlp = nb_neglog10_sf(obs, exp_safe, a_eff)
 
@@ -670,18 +1463,28 @@ def _apply_fdr(peaks: NestedPeakSet, params: CallParams) -> NestedPeakSet:
     if len(peaks) == 0:
         return peaks
 
-    region_p = np.array([r.neg_log10_p for r in peaks.regions])
-    n_tests = None
-    if params.fdr_scope == "genome":
-        genome = sum(peaks.chrom_sizes.values())
-        width = float(np.median([r.end - r.start for r in peaks.regions]))
-        n_tests = genome / max(width, 1.0)
-    elif params.fdr_scope != "candidates":
+    if params.fdr_scope not in ("genome", "candidates"):
         raise ValueError(f"fdr_scope must be 'genome' or 'candidates', "
                          f"got {params.fdr_scope!r}")
-    region_q = qvalue_from_neglog10p(region_p, n_tests=n_tests)
-    for r, q in zip(peaks.regions, region_q):
-        r.neg_log10_q = float(q)
+    # Focal-pass peaks reported standalone were already corrected over every
+    # position in the genome by the focal test; correcting them again as
+    # regions, with the genome divided by a median width that they
+    # themselves pull down to ~1 kb, is a second genome-wide correction
+    # (measured on H3K4me3 chr11: two of the four Havcr2 promoter peaks
+    # dropped).  They are corrected among themselves, as sub-peaks are.
+    hmm_regions = [r for r in peaks.regions if r.source != "focal"]
+    focal_regions = [r for r in peaks.regions if r.source == "focal"]
+    for group, scope in ((hmm_regions, params.fdr_scope), (focal_regions, "candidates")):
+        if not group:
+            continue
+        n_tests = None
+        if scope == "genome":
+            genome = sum(peaks.chrom_sizes.values())
+            width = float(np.median([r.end - r.start for r in group]))
+            n_tests = genome / max(width, 1.0)
+        qs = qvalue_from_neglog10p(np.array([r.neg_log10_p for r in group]), n_tests=n_tests)
+        for r, q in zip(group, qs):
+            r.neg_log10_q = float(q)
 
     subs = [s for r in peaks.regions for s in r.subpeaks]
     if subs:
@@ -696,6 +1499,117 @@ def _apply_fdr(peaks: NestedPeakSet, params: CallParams) -> NestedPeakSet:
     for r in kept.regions:
         r.subpeaks = [s for s in r.subpeaks if s.neg_log10_q >= cutoff]
     return kept
+
+
+def _merge_similar(intervals: Sequence[Tuple[int, int]], max_gap_bins: int,
+                   counts: np.ndarray, mu: np.ndarray, gap_fold_fraction: float,
+                   min_fold: float):
+    """Connect nearby similar measurements.
+
+    Consecutive intervals closer than ``max_gap_bins`` are joined when the gap
+    between them is itself enriched: its observed/expected fold must reach
+    ``gap_fold_fraction`` of the weaker neighbour's fold and ``min_fold``.  A
+    gap at background keeps the two apart whatever its length.
+    """
+    if max_gap_bins <= 0 or len(intervals) < 2:
+        return list(intervals)
+    if gap_fold_fraction <= 0:
+        return _merge_close(intervals, max_gap_bins)
+    pc = np.concatenate([[0.0], np.cumsum(counts, dtype=np.float64)])
+    pm = np.concatenate([[0.0], np.cumsum(mu, dtype=np.float64)])
+
+    def fold(a, b):
+        e = pm[b] - pm[a]
+        return (pc[b] - pc[a]) / e if e > 0 else 0.0
+
+    out = [list(intervals[0])]
+    for s, e in intervals[1:]:
+        ps, pe = out[-1]
+        if 0 < s - pe <= max_gap_bins:
+            f_gap = fold(pe, s)
+            need = max(min_fold, gap_fold_fraction * min(fold(ps, pe), fold(s, e)))
+            if f_gap >= need:
+                out[-1][1] = max(pe, e)
+                continue
+        elif s - pe <= 0:
+            out[-1][1] = max(pe, e)
+            continue
+        out.append([s, e])
+    return [(a, b) for a, b in out]
+
+
+def _weak_domains(counts: np.ndarray, mu: np.ndarray, bg: BackgroundModel, bin_size: int,
+                  window_bp: int, params: CallParams, genome_bp: int) -> List[Tuple[int, int]]:
+    """Candidate weak domains: runs of sliding ``window_bp`` sums significant
+    against the wide background.  See ``CallParams.weak_domain_bp``.
+
+    The reference is the wide background on purpose.  A local-contrast
+    reference (the lower of the two flanks) was tried and calls every step
+    in the background: at Pdcd1 the H3K9me3 track sits at 1.9 over
+    93.985-94.085 Mb and at 5.5-6.6 from 94.085 to past 94.6 Mb -- not a
+    domain, the neighbourhood's ordinary level (chr1 median bin 4.2) with
+    Pdcd1 in a euchromatic dip -- and the min-flank test called its edge.
+
+    Windows are stepped at a quarter window; the cut is Bonferroni over
+    genome / window non-overlapping windows (the steps are the same test four
+    times over, as in the focal pass).  Each run's footprint is trimmed at
+    both ends to the 1 kb-smoothed bins at the fold floor, so a domain does
+    not extend half a window into background.  Returns ``(start_bin,
+    end_bin)`` intervals.
+    """
+    k = max(2, int(window_bp // bin_size))
+    n = counts.size
+    if n < 2 * k:
+        return []
+    step = max(1, k // 4)
+    centres = np.arange(0, n, step)
+    lo = np.clip(centres - k // 2, 0, n)
+    hi = np.clip(lo + k, 0, n)
+    alpha = bg.alpha(mu)
+    pc = np.concatenate([[0.0], np.cumsum(counts, dtype=np.float64)])
+    pm = np.concatenate([[0.0], np.cumsum(mu, dtype=np.float64)])
+    pv = np.concatenate([[0.0], np.cumsum(alpha * mu * mu, dtype=np.float64)])
+    obs, exp = pc[hi] - pc[lo], pm[hi] - pm[lo]
+    ok = exp > 0
+    exp_s = np.where(ok, exp, 1.0)
+    f = ar1_factor(hi - lo, rho_from_inflation(bg.autocorr_inflation))
+    var = f * (exp_s + pv[hi] - pv[lo])
+    a_eff = np.maximum((var - exp_s) / (exp_s * exp_s), 1e-10)
+    nlp = nb_neglog10_sf(obs, exp_s, a_eff)
+    n_tests = max(1.0, genome_bp / float(window_bp))
+    cut = (-np.log10(params.qvalue) if params.qvalue > 0 else 0.0) + np.log10(n_tests)
+    fmin = max(float(params.weak_domain_min_fold), float(params.min_fold))
+    sig = ok & (nlp >= cut) & (obs >= fmin * exp_s)
+    if not sig.any():
+        return []
+    k_s = max(1, int(1000 // bin_size))
+    sm_c = uniform_filter1d(counts, k_s, mode="nearest") if k_s > 1 else counts
+    sm_m = uniform_filter1d(mu, k_s, mode="nearest") if k_s > 1 else mu
+    above = sm_c >= params.min_fold * sm_m
+    out: List[Tuple[int, int]] = []
+    for a, b in _runs(sig, 1):
+        s0, e0 = int(lo[a]), int(hi[b - 1])
+        idx = np.flatnonzero(above[s0:e0])
+        if idx.size == 0:
+            continue
+        s1, e1 = s0 + int(idx[0]), s0 + int(idx[-1]) + 1
+        if out and s1 <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], e1))
+        else:
+            out.append((s1, e1))
+    return out
+
+
+def _union_intervals(a: Sequence[Tuple[int, int]], b: Sequence[Tuple[int, int]]):
+    """Union of two interval lists (bins), overlapping or touching intervals joined."""
+    allv = sorted([tuple(x) for x in a] + [tuple(x) for x in b])
+    out: List[List[int]] = []
+    for s0, e0 in allv:
+        if out and s0 <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], e0)
+        else:
+            out.append([int(s0), int(e0)])
+    return [(x, y) for x, y in out]
 
 
 def _merge_close(intervals: Sequence[Tuple[int, int]], max_gap_bins: int):

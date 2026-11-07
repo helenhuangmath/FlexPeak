@@ -32,19 +32,16 @@ def _autocorrelation_length(x, max_lag: int = 400) -> int:
 
     A direct read on whether the signal is punctate or domain-like, and the
     reason a mark's natural scale can be inferred without being told.
+    FFT-based on a strided sample: the lag-by-lag loop was 400 passes over
+    the whole genome, minutes on a 10 bp mouse genome.
     """
+    from ..stats.nbtest import autocorrelation_length_bp
+
     x = np.asarray(x, dtype=np.float64)
-    x = x - x.mean()
-    denom = float((x * x).sum())
-    if denom <= 0 or x.size < 10:
+    if x.size < 10:
         return 0
-    max_lag = int(min(max_lag, x.size // 2))
-    thresh = 1.0 / np.e
-    for lag in range(1, max_lag):
-        r = float(np.dot(x[:-lag], x[lag:])) / denom
-        if r < thresh:
-            return lag
-    return max_lag
+    lag_bp = autocorrelation_length_bp(x, 1, max_lag_bp=max_lag)
+    return int(min(lag_bp, max_lag))
 
 
 def _frip(cov: Coverage, peaks: NestedPeakSet) -> float:

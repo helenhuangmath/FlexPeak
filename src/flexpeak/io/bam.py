@@ -26,7 +26,7 @@ import numpy as np
 
 from ..signal.coverage import Coverage
 
-__all__ = ["load_bam", "estimate_fragment_length", "DEFAULT_EXCLUDE"]
+__all__ = ["load_bam", "load_bam_windows", "estimate_fragment_length", "DEFAULT_EXCLUDE"]
 
 DEFAULT_EXCLUDE = ("chrM", "chrEBV", "M", "MT")
 
@@ -53,7 +53,9 @@ def _require_pysam():
 
 def _scan_chrom(path: str, chrom: str, bad: int, mapq: int, paired: bool,
                 max_fragment: int = 1000,
-                reference: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+                reference: Optional[str] = None,
+                start: Optional[int] = None,
+                end: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
     """One pass over a chromosome -> fragment anchor arrays.
 
     Single-end: ``(forward read starts, reverse read ends)``.
@@ -65,9 +67,10 @@ def _scan_chrom(path: str, chrom: str, bad: int, mapq: int, paired: bool,
     a: List[int] = []
     b: List[int] = []
     push_a, push_b = a.append, b.append
+    region = (chrom,) if start is None else (chrom, int(start), int(end))
     with pysam.AlignmentFile(path, reference_filename=reference) as af:
         if paired:
-            for read in af.fetch(chrom):
+            for read in af.fetch(*region):
                 f = read.flag
                 if f & bad or not f & _PROPER_PAIR or read.mapping_quality < mapq:
                     continue
@@ -78,7 +81,7 @@ def _scan_chrom(path: str, chrom: str, bad: int, mapq: int, paired: bool,
                 push_a(s)
                 push_b(s + tlen)
         else:
-            for read in af.fetch(chrom):
+            for read in af.fetch(*region):
                 f = read.flag
                 if f & bad or read.mapping_quality < mapq:
                     continue
@@ -327,3 +330,35 @@ def load_bam(
         fragment_length=frag_len,
         meta={"paired": bool(paired), "mapq": mapq, "nsc": nsc},
     )
+
+
+def load_bam_windows(path: str, windows: Sequence[Tuple[str, int, int]], bin_size: int,
+                     mapq: int = 30, paired: Optional[bool] = None,
+                     fragment_length: Optional[int] = None, max_fragment: int = 1000,
+                     keep_duplicates: bool = False, reference: Optional[str] = None,
+                     **_ignored) -> List[np.ndarray]:
+    """Binned fragment coverage over ``(chrom, start, end)`` windows only.
+
+    What lets the quick scan sample several chromosomes for the price of
+    one: ``fetch`` on a region touches only the index blocks it needs.
+    Single-end reads are extended by a length estimated on the first window.
+    """
+    pysam = _require_pysam()
+    bad = (_BAD_FLAGS & ~0x400) if keep_duplicates else _BAD_FLAGS
+    with pysam.AlignmentFile(path, reference_filename=reference) as af:
+        if paired is None:
+            paired = _detect_paired(af, [w[0] for w in windows])
+    scans = [_scan_chrom(path, c, bad, mapq, bool(paired), max_fragment, reference, s, e)
+             for c, s, e in windows]
+    frag_len = fragment_length
+    if not paired and frag_len is None:
+        (plus, minus), (_, s0, e0) = scans[0], windows[0]
+        frag_len, _ = _strand_xcorr(np.clip(plus - s0, 0, None), np.clip(minus - s0, 0, None),
+                                    e0 - s0)
+    frag_len = int(frag_len or 200)
+    out = []
+    for (a, b), (_, s, e) in zip(scans, windows):
+        st, en = _fragments(a, b, bool(paired), frag_len)
+        n = (e - s) // bin_size
+        out.append(_bin_fragments(st - s, en - s, e - s, bin_size)[:n])
+    return out
