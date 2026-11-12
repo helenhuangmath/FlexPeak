@@ -2,8 +2,8 @@
 
 This document describes the statistical method implemented in FlexPeak and
 the reasoning behind its main design choices. Usage is described in the
-[README](../README.md) and a worked example in [TUTORIAL.md](TUTORIAL.md);
-the benchmark protocol is in [Benchmark/README.md](../Benchmark/README.md).
+[README](https://github.com/helenhuangmath/FlexPeak#readme) and a worked example in [tutorial](TUTORIAL.md);
+the benchmark protocol is in [Benchmark/README.md](https://github.com/helenhuangmath/FlexPeak/blob/main/Benchmark/README.md).
 Every default in `flexpeak.caller.CallParams` is documented in the source
 with the measurement on which it is based.
 

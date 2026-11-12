@@ -2,7 +2,7 @@
 
 This tutorial uses synthetic data generated from a fixed seed, so it is small,
 fast, and self-contained. An example on public data,
-[`examples/geo_h3k9me3.py`](../examples/geo_h3k9me3.py), downloads its GEO input
+[`examples/geo_h3k9me3.py`](https://github.com/helenhuangmath/FlexPeak/blob/main/examples/geo_h3k9me3.py), downloads its GEO input
 on demand (see the last section).
 
 ## Install
@@ -58,39 +58,21 @@ flexpeak stats \
   --outdir examples/tutorial_out/figures
 ```
 
-Every figure is set in Arial with black text. Each panel is an unfilled box with
-a black outline, and there are no grid or other background lines inside it.
 
 ## Figures From Real Data
 
-[`examples/geo_h3k9me3.py`](../examples/geo_h3k9me3.py) calls peaks on a public
-H3K9me3 bigWig (GEO GSE285245, mm10, chr19) and keeps four of its statistics
-figures here. Regenerate them with:
+[`examples/geo_h3k9me3.py`](https://github.com/helenhuangmath/FlexPeak/blob/main/examples/geo_h3k9me3.py)
+calls peaks on a public H3K9me3 bigWig (GEO GSE285245, mm10, chr19). The
+bigWig, the coverage cache and the results are written to `examples/geo_out/`,
+which is not version-controlled. Regenerate the figure below with:
 
 ```bash
 python examples/geo_h3k9me3.py --quick --keep-figures
 ```
 
-The bigWig, the coverage cache and the results are written to
-`examples/geo_out/`, which is not version-controlled.
-
-The one-page summary: counts, width, enrichment, significance, and per-chromosome
-totals.
+The one-page summary shows counts, region widths, fold enrichment, significance
+and calls per chromosome. H3K9me3 gives mostly broad domains of a few kb.
+Because the input is a bigWig rather than raw counts, the q-values are
+approximate.
 
 ![Summary of the chr19 H3K9me3 call set](figures/tutorial/geo_h3k9me3_chr19_summary.png)
-
-Region widths and nested sub-peak widths on one log axis. H3K9me3 produces mostly
-broad domains, with narrower sub-peaks nested inside them.
-
-![Width distribution](figures/tutorial/geo_h3k9me3_chr19_width_distribution.png)
-
-Fold enrichment and significance. Both are cut off at the call thresholds, so
-the left edge of each panel is set by the threshold, not by the data. bigWig
-input is not raw counts, so these q-values are approximate.
-
-![Enrichment and significance](figures/tutorial/geo_h3k9me3_chr19_enrichment.png)
-
-Width against enrichment: a large group of calls sitting just above the
-`min_fold` line is a sign of weak calls.
-
-![Width against enrichment](figures/tutorial/geo_h3k9me3_chr19_width_vs_enrichment.png)

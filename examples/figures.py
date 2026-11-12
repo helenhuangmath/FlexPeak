@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the figures in docs/figures/ from synthetic data with known truth.
+"""Correctness figures from synthetic data with known truth (examples/figures_out/).
 
     python examples/figures.py            # all figures
     python examples/figures.py fig2 fig3  # just those
@@ -40,7 +40,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUTDIR = os.path.join(os.path.dirname(HERE), "docs", "figures")
+OUTDIR = os.path.join(HERE, "figures_out")
 
 # -- palette ----------------------------------------------------------------
 # Categorical slots 1-3 of a validated colourblind-safe order; the first three
