@@ -2,18 +2,6 @@
 
 **Flexible, adaptive peak calling for ChIP-seq, CUT&RUN, CUT&Tag and ATAC-seq**
 
-| | |
-|---|---|
-| **Version** | 1.1.0 |
-| **Author and maintainer** | Hua Huang |
-| **License** | MIT |
-| **Language** | Python (≥ 3.9) |
-| **Depends** | numpy (≥ 1.21), scipy (≥ 1.7) |
-| **Suggests** | pysam, pyBigWig, numba, matplotlib |
-| **Topics** | ChIP-seq, CUT&RUN, CUT&Tag, ATAC-seq, peak detection, differential peak calling, epigenetics, quality control |
-| **URL** | <https://github.com/helenhuangmath/FlexPeak> |
-| **Bug reports** | <https://github.com/helenhuangmath/FlexPeak/issues> |
-
 ## Description
 
 FlexPeak identifies enriched regions in chromatin profiling data. Narrow peaks
@@ -365,3 +353,17 @@ experimental data is provided in
 ## License
 
 FlexPeak is released under the MIT License.
+
+## Package information
+
+| | |
+|---|---|
+| **Version** | 1.1.0 |
+| **Author and maintainer** | Hua Huang |
+| **License** | MIT |
+| **Language** | Python (≥ 3.9) |
+| **Depends** | numpy (≥ 1.21), scipy (≥ 1.7) |
+| **Suggests** | pysam, pyBigWig, numba, matplotlib |
+| **Topics** | ChIP-seq, CUT&RUN, CUT&Tag, ATAC-seq, peak detection, differential peak calling, epigenetics, quality control |
+| **URL** | <https://github.com/helenhuangmath/FlexPeak> |
+| **Bug reports** | <https://github.com/helenhuangmath/FlexPeak/issues> |
