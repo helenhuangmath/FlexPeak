@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import warnings
 from dataclasses import dataclass, asdict, field
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -113,7 +114,7 @@ class CallParams:
     call_subpeaks: bool = True
     domain_min_width: int = 2000
     """Regions at least this wide are labelled ``domain`` rather than ``peak``."""
-    background_model: str = "nb"  # "nb" | "poisson" (ablation, DESIGN 9.5)
+    background_model: str = "nb"  # "nb" | "poisson" (ablation, DESIGN.md 11)
     boundary_fraction: float = 0.5
     hmm_stay_background: float = 0.995
     hmm_stay_enriched: float = 0.98
@@ -123,8 +124,33 @@ class CallParams:
     Without it a peak sets its own background: the windowed mean it is divided
     by includes the peak, so fold enrichment collapses toward 1 in proportion to
     how much of the window the feature fills.  0 restores the plain windowed
-    mean (DESIGN 9.5 ablation)."""
+    mean (DESIGN.md 11 ablation)."""
     background_exclude_iters: int = 3
+    dispersion: Optional[Tuple[float, float]] = None
+    """Pin the per-bin dispersion trend ``(a0, a1)`` (``alpha = a0 + a1 / mu``)
+    instead of fitting it on this sample.  The fit is one number pair per
+    library, and libraries of one experiment should not be tested under
+    different noise models because their estimates differ: fit each, take
+    the median (``<name>_qc.json``: ``dispersion_a0`` / ``dispersion_a1``),
+    and pin it for all of them."""
+    segment_dispersion: Optional[Tuple[float, float]] = None
+    """The same pin for the trend on segmentation-bin sums, which is the
+    dispersion the HMM segments with (``segment_dispersion_a0`` / ``_a1`` in
+    the QC)."""
+    max_width: Optional[int] = None
+    """Widest region reported, bp; None: no cap.  A region wider than this is
+    reported as its sub-peaks (each a standalone ``peak``) or, if it has
+    none, dropped.  For assays whose features are narrow by nature (the
+    ``atac`` and ``tf`` presets): a 100 kb "accessible domain" is an
+    amplified or otherwise elevated-background stretch, not open
+    chromatin."""
+    background_depth_aware: bool = True
+    """Size the background windows and the signal exclusion by the fragments
+    they hold, on count data of known depth (``effective_windows`` and
+    ``_signal_threshold`` in ``background.nb``): each window is widened to
+    hold ~20 fragments, and a stretch is held out as signal only when it is
+    also 3 SD of fragment noise above the background.  A deep library is
+    unaffected; off restores the windows and the plain fold rule (ablation)."""
     background_robust_start: Optional[bool] = None
     """Start the background's signal exclusion from a running median instead
     of the plain windowed mean (see ``local_lambda(robust_start=...)``).
@@ -154,6 +180,10 @@ class CallParams:
     ``background_exclude_fold``: judging a wider average makes noise cross the
     threshold far less often, which is what lets the threshold come down far
     enough to see a broad domain sitting at only ~1.5x background."""
+    hmm_fit_fraction: float = 1.0
+    """Share of each chromosome the HMM's Baum-Welch iterations run on
+    (evenly spaced blocks; see ``NBHMM.fit_fraction``).  The posterior the
+    calls are made from is always computed on the whole chromosome."""
     hmm_fit_state_dispersion: bool = False
     """Fit each HMM state's dispersion instead of reusing the background trend.
     Off: measured to cost more sensitivity than it buys (see NBHMM)."""
@@ -292,6 +322,8 @@ class CallParams:
         d["bandwidths"] = list(self.bandwidths)
         d["focal_scales"] = list(self.focal_scales)
         d["focal_flank_factors"] = list(self.focal_flank_factors)
+        for k in ("dispersion", "segment_dispersion"):
+            d[k] = list(d[k]) if d[k] is not None else None
         return d
 
     def replace(self, **kw) -> "CallParams":
@@ -330,8 +362,19 @@ PRESETS: Dict[str, Dict] = {
     "h3k36me3": dict(bin_size=100, windows=(1_000_000, 5_000_000),
                      bandwidths=(500, 1500, 5000), min_width=500,
                      domain_min_width=5000, min_fold=1.2),
+    # max_width: accessible elements are sub-kb to a few kb, clusters of them
+    # (super-enhancers, HOX) up to ~20 kb.  On 18 SNU449 libraries the widest
+    # region called with a sound background was 12.6 kb; the cap only ever
+    # acts on what a broken background lets through (amplified stretches of
+    # an aneuploid genome read as 100 kb - 2 Mb "domains").
+    # hmm_fit_fraction: measured on six of those libraries against a full
+    # fit -- region Jaccard 0.994-0.995, recall of MACS3 peaks, overlap with
+    # the pooled-replicate set and replicate support all unchanged to +/-
+    # 0.001, segmentation 10-20 s -> 6-9 s.  Only this preset samples by
+    # default; elsewhere it has not been measured.
     "atac": dict(bin_size=10, windows=(1000, 5000, 10000), bandwidths=(50, 150, 500),
-                 min_width=100, domain_min_width=1500, min_fold=2.0),
+                 min_width=100, domain_min_width=1500, min_fold=2.0, max_width=50_000,
+                 hmm_fit_fraction=0.25),
 }
 
 
@@ -362,6 +405,7 @@ def call_peaks(
     return_details: bool = False,
     background: Optional[BackgroundModel] = None,
     segmentation_cache: Optional[Dict] = None,
+    n_jobs: Optional[int] = None,
 ):
     """Call nested peaks on binned coverage.
 
@@ -377,6 +421,10 @@ def call_peaks(
     posterior cutoff, ``min_fold`` and everything downstream of the posterior
     leave the fit unchanged, so a sweep over them fits the HMM once instead of
     at every grid point.  Pass one dict per (treatment, background) pair.
+
+    ``n_jobs`` calls the chromosomes in that many worker processes
+    (``<= 0``: every CPU allocated to this process; ``None``/1: serial).  The
+    result is identical to the serial call.
     """
     params = params or CallParams()
 
@@ -405,13 +453,29 @@ def call_peaks(
     if msg:
         warnings.warn(msg, stacklevel=2)
 
+    import time as _time
+
+    timing: Dict[str, float] = {}
+    _t = _time.perf_counter()
+
+    def _lap(label: str) -> None:
+        nonlocal _t
+        now = _time.perf_counter()
+        timing[label] = timing.get(label, 0.0) + now - _t
+        _t = now
+
     bg = background if background is not None else fit_background(
-        treatment, control, params, covariates)
+        treatment, control, params, covariates, n_jobs=n_jobs)
+    if params.dispersion is not None:
+        import dataclasses as _dc
+
+        bg = _dc.replace(bg, a0=float(params.dispersion[0]), a1=float(params.dispersion[1]))
+    _lap("background")
 
     bs = treatment.bin_size
     min_bins = max(1, params.min_width // bs)
     regions: List[Region] = []
-    diagnostics: Dict = {"chroms": {}}
+    diagnostics: Dict = {"chroms": {}, "timing": timing}
 
     # One scale estimate for the whole sample, used for both the segmentation
     # bin and the HMM dwell floor.  Per chromosome it is too unstable to trust
@@ -419,8 +483,9 @@ def call_peaks(
     # the chromosomes is worse than one that is simply wrong.
     cache = segmentation_cache if segmentation_cache is not None else {}
     if "signal_scale_bp" not in cache:
-        cache["signal_scale_bp"] = signal_scale_bp(treatment)
+        cache["signal_scale_bp"] = signal_scale_bp(treatment, n_jobs=n_jobs)
     scale_bp = cache["signal_scale_bp"]
+    _lap("signal_scale")
     seg_bs = _segment_bin_size(treatment, params, scale_bp)
     factor = max(1, seg_bs // bs)
     diagnostics["signal_scale_bp"] = int(scale_bp)
@@ -438,11 +503,14 @@ def call_peaks(
 
         cs, ms = [], []
         for chrom in sorted(treatment.bins):
-            c = treatment.bins[chrom].astype(np.float64)
-            m = bg.mu[chrom].astype(np.float64)
+            c, m = treatment.bins[chrom], bg.mu[chrom]
             n = min(c.size, m.size)
-            cs.append(_coarsen(c[:n], factor))
-            ms.append(_coarsen(m[:n], factor))
+            if factor > 1:
+                cs.append(_coarsen(c[:n], factor))
+                ms.append(_coarsen(m[:n], factor))
+            else:
+                cs.append(c[:n].astype(np.float64))
+                ms.append(m[:n].astype(np.float64))
         c_all, m_all = np.concatenate(cs), np.concatenate(ms)
         if robust_start_enabled(params) and params.background_exclude_fold > 0:
             # Background segmentation bins only, as the background's own
@@ -458,102 +526,32 @@ def call_peaks(
             c_all, m_all = c_all[::step], m_all[::step]
         cache[seg_key] = estimate_dispersion(c_all, m_all)
     seg_a0, seg_a1 = cache[seg_key]
+    diagnostics["segment_dispersion_fitted"] = {"a0": float(seg_a0), "a1": float(seg_a1)}
+    if params.segment_dispersion is not None:
+        seg_a0, seg_a1 = (float(v) for v in params.segment_dispersion)
     diagnostics["segment_dispersion"] = {"a0": float(seg_a0), "a1": float(seg_a1)}
 
+    _lap("segment_dispersion")
     weak_bp = weak_domain_window_bp(params)
     genome_bp = int(sum(treatment.chrom_sizes.get(c, a.size * bs)
                         for c, a in treatment.bins.items()))
     diag_weak = 0
-    for chrom in sorted(treatment.bins):
-        counts = treatment.bins[chrom].astype(np.float64)
-        mu = bg.mu[chrom].astype(np.float64)
-        if counts.size != mu.size:  # pragma: no cover - defensive
-            m = min(counts.size, mu.size)
-            counts, mu = counts[:m], mu[:m]
-
-        # Segment on coarsened bins, then map the posterior back to reporting
-        # resolution.  Only the segmentation is coarsened: region statistics,
-        # the region-level test and sub-peak detection all still run on the
-        # fine bins, so nothing but the boundary quantisation is given up.
-        c_seg = _coarsen(counts, factor)
-        mu_seg = _coarsen(mu, factor)
-        alpha = bg.alpha(mu)
-        # The dispersion of a SUM of bins is not the per-bin trend evaluated at
-        # the summed mean -- that is the same mistake aggregate_nb_params exists
-        # to prevent, and it is far from harmless here.  Var(sum) = sum(mu_i) +
-        # sum(alpha_i mu_i^2), inflated for autocorrelation; for homogeneous
-        # bins that is alpha/k, so reading the trend at k*mu instead leaves the
-        # dispersion a factor of k too large and the states become
-        # indistinguishable exactly when the bins get coarse enough to be
-        # useful.  Measured on H3K9me3, it made called territory *fall* from
-        # 5.7% to 0.8% as the segmentation coarsened, when it should have risen.
-        alpha_seg = (np.maximum(seg_a0 + seg_a1 / np.maximum(mu_seg, 1e-9), 1e-8)
-                     if factor > 1 else alpha)
-
-        if params.background_model == "poisson":
-            alpha = np.full_like(mu, 1e-9)  # NB -> Poisson, for the ablation
-            alpha_seg = np.full_like(mu_seg, 1e-9)
-
-        hmm = NBHMM(
-            stay_background=params.hmm_stay_background,
-            stay_enriched=params.hmm_stay_enriched,
-            min_stay_enriched=_dwell_floor(
-                scale_bp if params.dwell_from_autocorrelation else 0,
-                factor * bs, params),
-            fit_state_dispersion=params.hmm_fit_state_dispersion,
-        )
-        key = (chrom, factor, hmm.stay_background, hmm.stay_enriched,
-               hmm.min_stay_enriched, hmm.fit_state_dispersion,
-               params.background_model)
-        res = cache.get(key)
-        if res is None:
-            _, res = segment_chromosome(
-                c_seg, mu_seg, alpha_seg,
-                posterior_cutoff=params.posterior_cutoff,
-                min_bins=1,
-                hmm=hmm,
-            )
-            if factor > 1:
-                res.posterior = np.repeat(res.posterior, factor)[: counts.size]
-            cache[key] = res
-        posterior = res.posterior
-        intervals = _runs(posterior >= params.posterior_cutoff, min_bins)
-        intervals = _merge_similar(
-            intervals, params.max_gap // bs if params.max_gap else 0, counts, mu,
-            params.gap_fold_fraction, params.min_fold)
-        if weak_bp:
-            weak = _weak_domains(counts, mu, bg, bs, weak_bp, params, genome_bp)
-            diag_weak += len(weak)
-            if weak:
-                intervals = _union_intervals(intervals, weak)
-        diagnostics["chroms"][chrom] = {
-            "n_intervals": len(intervals),
-            "multipliers": res.multipliers.tolist(),
-            "hmm_iter": res.n_iter,
-            "hmm_converged": res.converged,
-            "min_stay_enriched": hmm.min_stay_enriched,
-            "dwell_floor_bp": (
-                int(round(factor * bs / (1.0 - hmm.min_stay_enriched)))
-                if 0.0 < hmm.min_stay_enriched < 1.0 else 0
-            ),
-            "dispersion_scale": (
-                np.round(res.dispersion_scale, 2).tolist()
-                if res.dispersion_scale is not None else None
-            ),
-            "fitted_dwell_bp": [
-                int(round(factor * bs / max(1.0 - d, 1e-9)))
-                for d in np.diag(res.transitions)
-            ],
-        }
-
-        chrom_len = treatment.chrom_sizes.get(chrom, counts.size * bs)
-        regions.extend(_build_regions(
-            chrom, intervals, counts, mu, alpha, res.posterior, bs, chrom_len,
-            params, bg.autocorr_inflation,
-            skip_subpeaks=(params.focal_pass and bool(params.focal_windows)
-                           and bool(params.windows)
-                           and min(params.windows) > max(params.focal_windows)),
-        ))
+    skip_sub = (params.focal_pass and bool(params.focal_windows)
+                and bool(params.windows)
+                and min(params.windows) > max(params.focal_windows))
+    ctx = _ChromContext(treatment=treatment, bg=bg, params=params, factor=factor,
+                        scale_bp=scale_bp, seg_a0=seg_a0, seg_a1=seg_a1,
+                        weak_bp=weak_bp, genome_bp=genome_bp, skip_subpeaks=skip_sub,
+                        cache=cache, keep_fit=segmentation_cache is not None)
+    order = sorted(treatment.bins)
+    for chrom, (regs, diag, n_weak, key, fit) in zip(
+            order, _map_chromosomes(ctx, order, n_jobs)):
+        regions.extend(regs)
+        diagnostics["chroms"][chrom] = diag
+        diag_weak += n_weak
+        if fit is not None:
+            cache[key] = fit
+    _lap("segmentation")
 
     diagnostics["weak_domain_bp"] = int(weak_bp)
     diagnostics["n_weak_domain_candidates"] = int(diag_weak)
@@ -578,6 +576,7 @@ def call_peaks(
                 "genome_mean": bg.genome_mean,
             },
             "segment_bin_size": int(factor * bs),
+            "segment_dispersion": {"a0": float(seg_a0), "a1": float(seg_a1)},
             "signal_scale_bp": int(scale_bp),
             "is_count_data": treatment.is_count,
             "approximate_pvalues": not treatment.is_count,
@@ -585,21 +584,324 @@ def call_peaks(
         chrom_sizes=dict(treatment.chrom_sizes),
     )
 
-    if not focal_ran:
+    _lap("focal" if focal_ran else "assemble")
+    diagnostics["n_candidates"] = len(peaks)
+    if focal_ran:
         # Focal-pass sub-peaks are HMM-segmented, NB-tested regions in their
         # own right; the robust-z gate exists for scale-space noise bumps.
-        _gate_domain_subpeaks(peaks, params)
-    peaks = _apply_fdr(peaks, params)
+        peaks = _apply_fdr(peaks, params)
+    else:
+        # Sub-peaks are searched only in the regions that survive the
+        # region-level FDR.  They used to be searched in every HMM candidate
+        # first: on a sparse ATAC library that is ~350,000 candidates for
+        # ~25,000 calls, and the search was most of the run.
+        def _subpeaks(kept: NestedPeakSet) -> None:
+            if params.call_subpeaks and not skip_sub:
+                _fill_subpeaks(ctx, kept.regions, n_jobs)
+                _gate_domain_subpeaks(kept, params)
+
+        peaks = _apply_fdr(peaks, params, subpeaks=_subpeaks)
+    if params.max_width:
+        peaks, n_capped = _cap_width(peaks, int(params.max_width))
+        diagnostics["regions_over_max_width"] = n_capped
+        peaks.params["regions_over_max_width"] = n_capped
+    _lap("fdr_subpeaks")
     if blacklist:
         before = len(peaks)
         peaks = peaks.exclude(blacklist)
         diagnostics["blacklisted_regions_dropped"] = before - len(peaks)
         peaks.params["blacklist_regions_dropped"] = before - len(peaks)
     peaks.name_all(name)
+    _lap("blacklist")
 
     if return_details:
         return CallResult(peaks=peaks, background=bg, params=params, diagnostics=diagnostics)
     return peaks
+
+
+@dataclass
+class _ChromContext:
+    """Everything one chromosome's call needs; shared with forked workers."""
+
+    treatment: Coverage
+    bg: BackgroundModel
+    params: CallParams
+    factor: int
+    scale_bp: int
+    seg_a0: float
+    seg_a1: float
+    weak_bp: int
+    genome_bp: int
+    skip_subpeaks: bool
+    cache: Dict
+    keep_fit: bool
+
+
+def _call_chromosome(ctx: _ChromContext, chrom: str):
+    """Segment one chromosome and build its regions.
+
+    Returns ``(regions, diagnostics, n_weak_candidates, cache_key, fit)``;
+    ``fit`` is the HMM result when it was fitted here and the caller keeps a
+    segmentation cache, else None.  Its posterior is at SEGMENTATION
+    resolution (``_map_chromosomes`` expands it), which is all the fit has.
+    """
+    treatment, bg, params, factor = ctx.treatment, ctx.bg, ctx.params, ctx.factor
+    bs = treatment.bin_size
+    min_bins = max(1, params.min_width // bs)
+    counts32, mu32 = treatment.bins[chrom], bg.mu[chrom]
+    if counts32.size != mu32.size:  # pragma: no cover - defensive
+        m = min(counts32.size, mu32.size)
+        counts32, mu32 = counts32[:m], mu32[:m]
+    n = counts32.size
+
+    # Segment on coarsened bins, then map the posterior back to reporting
+    # resolution.  Only the segmentation is coarsened: region statistics,
+    # the region-level test and sub-peak detection all still run on the
+    # fine bins, so nothing but the boundary quantisation is given up.
+    mu = mu32.astype(np.float64)
+    if factor > 1:
+        c_seg = _coarsen(counts32, factor)
+        mu_seg = _coarsen(mu32, factor)
+    else:
+        c_seg = counts32.astype(np.float64)
+        mu_seg = mu
+    alpha = bg.alpha(mu)
+    # The dispersion of a SUM of bins is not the per-bin trend evaluated at
+    # the summed mean -- that is the same mistake aggregate_nb_params exists
+    # to prevent, and it is far from harmless here.  Var(sum) = sum(mu_i) +
+    # sum(alpha_i mu_i^2), inflated for autocorrelation; for homogeneous
+    # bins that is alpha/k, so reading the trend at k*mu instead leaves the
+    # dispersion a factor of k too large and the states become
+    # indistinguishable exactly when the bins get coarse enough to be
+    # useful.  Measured on H3K9me3, it made called territory *fall* from
+    # 5.7% to 0.8% as the segmentation coarsened, when it should have risen.
+    alpha_seg = (np.maximum(ctx.seg_a0 + ctx.seg_a1 / np.maximum(mu_seg, 1e-9), 1e-8)
+                 if factor > 1 else alpha)
+
+    if params.background_model == "poisson":
+        alpha = np.full_like(mu, 1e-9)  # NB -> Poisson, for the ablation
+        alpha_seg = np.full_like(mu_seg, 1e-9)
+
+    hmm = NBHMM(
+        stay_background=params.hmm_stay_background,
+        stay_enriched=params.hmm_stay_enriched,
+        min_stay_enriched=_dwell_floor(
+            ctx.scale_bp if params.dwell_from_autocorrelation else 0,
+            factor * bs, params),
+        fit_state_dispersion=params.hmm_fit_state_dispersion,
+        decode_path=False,
+        fit_fraction=params.hmm_fit_fraction,
+    )
+    key = (chrom, factor, hmm.stay_background, hmm.stay_enriched,
+           hmm.min_stay_enriched, hmm.fit_state_dispersion,
+           params.background_model, hmm.fit_fraction)
+    res = ctx.cache.get(key)
+    fitted = res is None
+    if fitted:
+        _, res = segment_chromosome(
+            c_seg, mu_seg, alpha_seg,
+            posterior_cutoff=params.posterior_cutoff,
+            min_bins=1,
+            hmm=hmm,
+        )
+        post_seg = res.posterior
+    else:
+        # A cached fit holds the posterior at reporting resolution, where it
+        # is the segmentation posterior repeated.
+        post_seg = res.posterior[::factor] if factor > 1 else res.posterior
+
+    # Runs of enriched segmentation bins, as reporting-bin intervals.  The
+    # last segmentation bin may run past the chromosome end; clip it.
+    seg_runs = _runs(post_seg >= params.posterior_cutoff, 1)
+    intervals = [(a * factor, min(b * factor, n)) for a, b in seg_runs]
+    intervals = [(a, b) for a, b in intervals if b - a >= min_bins]
+
+    chrom_len = treatment.chrom_sizes.get(chrom, n * bs)
+    n_weak = 0
+    need_fine = bool(params.max_gap) or bool(ctx.weak_bp) or factor <= 1
+    if need_fine:
+        counts = counts32.astype(np.float64)
+        posterior = (np.repeat(post_seg, factor)[:n] if factor > 1 else post_seg)
+        intervals = _merge_similar(
+            intervals, params.max_gap // bs if params.max_gap else 0, counts, mu,
+            params.gap_fold_fraction, params.min_fold)
+        if ctx.weak_bp:
+            weak = _weak_domains(counts, mu, bg, bs, ctx.weak_bp, params, ctx.genome_bp)
+            n_weak = len(weak)
+            if weak:
+                intervals = _union_intervals(intervals, weak)
+        regions = _build_regions(
+            chrom, intervals, counts, mu, alpha, posterior, bs, chrom_len,
+            params, bg.autocorr_inflation, skip_subpeaks=True,
+        )
+    else:
+        # Every interval starts and ends on a segmentation-bin edge, so the
+        # region sums are sums of segmentation-bin sums: the prefix arrays
+        # are built at that resolution (10-100x shorter) and index the same
+        # totals the reporting-bin prefix sums would.
+        weights = np.full(post_seg.size, float(factor))
+        weights[-1] = float(n - (post_seg.size - 1) * factor)
+        prefix = (
+            np.concatenate([[0.0], np.cumsum(c_seg)]),
+            np.concatenate([[0.0], np.cumsum(mu_seg)]),
+            np.concatenate([[0.0], np.cumsum(_coarsen(alpha * mu * mu, factor))]),
+            np.concatenate([[0.0], np.cumsum(post_seg * weights)]),
+            factor,
+        )
+        regions = _build_regions(
+            chrom, intervals, None, None, None, None, bs, chrom_len,
+            params, bg.autocorr_inflation, skip_subpeaks=True, prefix=prefix,
+        )
+    diag = {
+        "n_intervals": len(intervals),
+        "multipliers": res.multipliers.tolist(),
+        "hmm_iter": res.n_iter,
+        "hmm_converged": res.converged,
+        "min_stay_enriched": hmm.min_stay_enriched,
+        "dwell_floor_bp": (
+            int(round(factor * bs / (1.0 - hmm.min_stay_enriched)))
+            if 0.0 < hmm.min_stay_enriched < 1.0 else 0
+        ),
+        "dispersion_scale": (
+            np.round(res.dispersion_scale, 2).tolist()
+            if res.dispersion_scale is not None else None
+        ),
+        "fitted_dwell_bp": [
+            int(round(factor * bs / max(1.0 - d, 1e-9)))
+            for d in np.diag(res.transitions)
+        ],
+    }
+    return regions, diag, n_weak, key, (res if fitted and ctx.keep_fit else None)
+
+
+#: Set in the parent right before the worker pool forks, so the workers see
+#: the coverage and the background through copy-on-write memory instead of
+#: having ~10 GB of arrays pickled to them.
+_FORK_CONTEXT: Optional[_ChromContext] = None
+
+
+def _chrom_task(chrom: str):
+    return _call_chromosome(_FORK_CONTEXT, chrom)
+
+
+#: Regions (as bin intervals) per chromosome for the sub-peak pass; set with
+#: ``_FORK_CONTEXT`` before the pool forks.
+_FORK_INTERVALS: Optional[Dict[str, List[Tuple[int, int]]]] = None
+
+
+def _subpeak_chromosome(ctx: _ChromContext, chrom: str,
+                        intervals: Sequence[Tuple[int, int]]) -> List[List[SubPeak]]:
+    treatment, bg, params = ctx.treatment, ctx.bg, ctx.params
+    bs = treatment.bin_size
+    counts = treatment.bins[chrom].astype(np.float64)
+    mu = bg.mu[chrom].astype(np.float64)
+    if counts.size != mu.size:  # pragma: no cover - defensive
+        m = min(counts.size, mu.size)
+        counts, mu = counts[:m], mu[:m]
+    alpha = (np.full_like(mu, 1e-9) if params.background_model == "poisson"
+             else bg.alpha(mu))
+    chrom_len = treatment.chrom_sizes.get(chrom, counts.size * bs)
+    return [_call_subpeaks(chrom, b0, b1, counts, mu, alpha, bs, chrom_len,
+                           params, bg.autocorr_inflation)
+            for b0, b1 in intervals]
+
+
+def _subpeak_task(chrom: str):
+    return _subpeak_chromosome(_FORK_CONTEXT, chrom, _FORK_INTERVALS[chrom])
+
+
+def _fill_subpeaks(ctx: _ChromContext, regions: Sequence[Region],
+                   n_jobs: Optional[int]) -> None:
+    """Search sub-peaks in ``regions`` (in place), one chromosome per worker."""
+    global _FORK_CONTEXT, _FORK_INTERVALS
+    bs = ctx.treatment.bin_size
+    by_chrom: Dict[str, List[Region]] = {}
+    for r in regions:
+        by_chrom.setdefault(r.chrom, []).append(r)
+    if not by_chrom:
+        return
+    n_bins = {c: ctx.treatment.bins[c].size for c in by_chrom}
+    intervals = {c: [(r.start // bs, min(-(-r.end // bs), n_bins[c])) for r in rs]
+                 for c, rs in by_chrom.items()}
+    order = sorted(by_chrom, key=lambda c: -len(by_chrom[c]))
+    jobs = resolve_call_jobs(n_jobs, len(order))
+    if jobs > 1 and len(regions) >= 2000:
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor
+
+        _FORK_CONTEXT, _FORK_INTERVALS = ctx, intervals
+        try:
+            with ProcessPoolExecutor(max_workers=jobs,
+                                     mp_context=mp.get_context("fork")) as pool:
+                found = dict(zip(order, pool.map(_subpeak_task, order)))
+        finally:
+            _FORK_CONTEXT = _FORK_INTERVALS = None
+    else:
+        found = {c: _subpeak_chromosome(ctx, c, intervals[c]) for c in order}
+    for c, rs in by_chrom.items():
+        for r, subs in zip(rs, found[c]):
+            r.subpeaks = subs
+
+
+def resolve_call_jobs(n_jobs: Optional[int], n_chroms: int) -> int:
+    """Worker processes for the per-chromosome call.
+
+    ``None`` or 1: serial.  ``<= 0``: automatic -- the CPUs this process may
+    use (the scheduler's allocation, not the machine's core count), capped at
+    the number of chromosomes.  Needs the ``fork`` start method (Linux); on
+    other platforms the call stays serial.
+    """
+    import multiprocessing as mp
+
+    if n_jobs is None or n_jobs == 1 or n_chroms <= 1:
+        return 1
+    if "fork" not in mp.get_all_start_methods():
+        return 1
+    if n_jobs <= 0:
+        try:
+            n_jobs = len(os.sched_getaffinity(0))
+        except AttributeError:  # pragma: no cover - not Linux
+            n_jobs = os.cpu_count() or 1
+    return max(1, min(int(n_jobs), n_chroms))
+
+
+def _map_chromosomes(ctx: _ChromContext, order: Sequence[str], n_jobs: Optional[int]):
+    """``_call_chromosome`` for every chromosome, results in ``order``.
+
+    Chromosomes are independent once the background, the dispersion and the
+    signal scale are fixed (all three are genome-wide and fitted before this
+    point), so they are called in worker processes.  The call was
+    single-threaded before: measured on a 7.5M-fragment ATAC library at
+    10 bp bins it used 58% of one core with eight allocated.
+    """
+    global _FORK_CONTEXT
+    jobs = resolve_call_jobs(n_jobs, len(order))
+    sizes = {c: ctx.treatment.bins[c].size for c in order}
+    if jobs <= 1:
+        done = {c: _call_chromosome(ctx, c) for c in order}
+    else:
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor
+
+        from .segment._kernels import warm_up
+
+        warm_up()  # compiled once here, inherited by every worker
+        # Largest first, so the pool does not finish on the longest task.
+        todo = sorted(order, key=lambda c: -sizes[c])
+        _FORK_CONTEXT = ctx
+        try:
+            with ProcessPoolExecutor(max_workers=jobs,
+                                     mp_context=mp.get_context("fork")) as pool:
+                done = dict(zip(todo, pool.map(_chrom_task, todo)))
+        finally:
+            _FORK_CONTEXT = None
+    out = []
+    for c in order:
+        regs, diag, n_weak, key, fit = done[c]
+        if fit is not None and ctx.factor > 1:
+            fit.posterior = np.repeat(fit.posterior, ctx.factor)[: sizes[c]]
+        out.append((regs, diag, n_weak, key, fit))
+    return out
 
 
 #: CallParams fields the background model depends on.  A fitted background can
@@ -607,7 +909,7 @@ def call_peaks(
 BACKGROUND_FIELDS = frozenset({
     "bin_size", "windows", "background_exclude_fold",
     "background_exclude_iters", "background_exclude_smooth_bp",
-    "background_robust_start",
+    "background_robust_start", "background_depth_aware",
 })
 
 
@@ -635,7 +937,8 @@ def weak_domain_window_bp(params: "CallParams") -> int:
 
 
 def fit_background(treatment: Coverage, control: Optional[Coverage],
-                   params: CallParams, covariates=None) -> BackgroundModel:
+                   params: CallParams, covariates=None,
+                   n_jobs: Optional[int] = None) -> BackgroundModel:
     """The background ``call_peaks`` would fit for these inputs and parameters.
 
     Coverage must already be at ``params.bin_size``.
@@ -646,6 +949,8 @@ def fit_background(treatment: Coverage, control: Optional[Coverage],
         exclude_iters=params.background_exclude_iters,
         exclude_smooth_bp=params.background_exclude_smooth_bp,
         robust_start=robust_start_enabled(params),
+        depth_aware=params.background_depth_aware,
+        n_jobs=n_jobs,
     )
 
 
@@ -671,10 +976,13 @@ def _coarsen(a: np.ndarray, factor: int) -> np.ndarray:
     pad = (-a.size) % factor
     if pad:
         a = np.concatenate([a, np.zeros(pad, dtype=a.dtype)])
-    return a.reshape(-1, factor).sum(axis=1)
+    # Summed in float64 whatever the input, so float32 coverage does not
+    # need a float64 copy of the whole chromosome first.
+    return a.reshape(-1, factor).sum(axis=1, dtype=np.float64)
 
 
-def signal_scale_bp(treatment: Coverage, min_bins: int = 1000) -> int:
+def signal_scale_bp(treatment: Coverage, min_bins: int = 1000,
+                    n_jobs: Optional[int] = None) -> int:
     """The mark's own scale in bp: a robust autocorrelation length.
 
     Estimated per chromosome and combined at the 75th percentile rather than the
@@ -686,10 +994,18 @@ def signal_scale_bp(treatment: Coverage, min_bins: int = 1000) -> int:
     were stable to within 2x.  Taking a high quantile is what stops one sparse
     chromosome from silently disabling every scale-derived setting on it.
     """
-    lens = [
-        autocorrelation_length_bp(a, treatment.bin_size)
-        for a in treatment.bins.values() if a.size >= min_bins
-    ]
+    arrays = [a for a in treatment.bins.values() if a.size >= min_bins]
+    jobs = resolve_call_jobs(n_jobs, len(arrays))
+    if jobs > 1:
+        # Threads, not processes: the work is one FFT per chromosome, which
+        # runs outside the interpreter lock.
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            lens = list(pool.map(
+                lambda a: autocorrelation_length_bp(a, treatment.bin_size), arrays))
+    else:
+        lens = [autocorrelation_length_bp(a, treatment.bin_size) for a in arrays]
     if not lens:
         return treatment.bin_size
     return int(max(np.percentile(lens, 75), treatment.bin_size))
@@ -1261,7 +1577,7 @@ def _as_subpeak(r: Region, arr: np.ndarray, bin_size: int) -> SubPeak:
 
 def _build_regions(chrom, intervals, counts, mu, alpha, posterior, bin_size,
                    chrom_len, params: CallParams, inflation: float = 1.0,
-                   skip_subpeaks: bool = False) -> List[Region]:
+                   skip_subpeaks: bool = False, prefix=None) -> List[Region]:
     """Every region of a chromosome in one pass: prefix sums for the
     aggregates and a single vectorised NB test.
 
@@ -1275,13 +1591,22 @@ def _build_regions(chrom, intervals, counts, mu, alpha, posterior, bin_size,
         return []
     iv = np.asarray(intervals, dtype=np.int64).reshape(-1, 2)
     b0, b1 = iv[:, 0], iv[:, 1]
-    pc = np.concatenate([[0.0], np.cumsum(counts, dtype=np.float64)])
-    pm = np.concatenate([[0.0], np.cumsum(mu, dtype=np.float64)])
-    pv = np.concatenate([[0.0], np.cumsum(np.asarray(alpha, dtype=np.float64) * mu * mu,
-                                          dtype=np.float64)])
-    pp = np.concatenate([[0.0], np.cumsum(posterior, dtype=np.float64)])
-    obs = pc[b1] - pc[b0]
-    exp = pm[b1] - pm[b0]
+    if prefix is not None:
+        # Prefix sums of counts, mu, alpha*mu^2 and posterior (weighted by
+        # reporting bins) over blocks of ``f`` reporting bins; the intervals
+        # start and end on block edges (the last may be clipped to the
+        # chromosome end, where the padding is zero).
+        pc, pm, pv, pp, blk = prefix
+        i0, i1 = b0 // blk, -(-b1 // blk)
+    else:
+        pc = np.concatenate([[0.0], np.cumsum(counts, dtype=np.float64)])
+        pm = np.concatenate([[0.0], np.cumsum(mu, dtype=np.float64)])
+        pv = np.concatenate([[0.0], np.cumsum(
+            np.asarray(alpha, dtype=np.float64) * mu * mu, dtype=np.float64)])
+        pp = np.concatenate([[0.0], np.cumsum(posterior, dtype=np.float64)])
+        i0, i1 = b0, b1
+    obs = pc[i1] - pc[i0]
+    exp = pm[i1] - pm[i0]
     ok = exp > 0
     exp_safe = np.where(ok, exp, 1.0)
     fold = np.where(ok, obs / exp_safe, 0.0)
@@ -1292,10 +1617,10 @@ def _build_regions(chrom, intervals, counts, mu, alpha, posterior, bin_size,
     if not ok.any():
         return []
     f = ar1_factor(b1 - b0, rho_from_inflation(inflation))
-    var = f * (exp_safe + pv[b1] - pv[b0])
+    var = f * (exp_safe + pv[i1] - pv[i0])
     a_eff = np.maximum((var - exp_safe) / (exp_safe * exp_safe), 1e-10)
     nlp = nb_neglog10_sf(obs, exp_safe, a_eff)
-    mean_post = (pp[b1] - pp[b0]) / np.maximum(b1 - b0, 1)
+    mean_post = (pp[i1] - pp[i0]) / np.maximum(b1 - b0, 1)
 
     out: List[Region] = []
     for i in np.flatnonzero(ok):
@@ -1458,8 +1783,16 @@ def _gate_domain_subpeaks(peaks: NestedPeakSet, params: CallParams) -> None:
         r.subpeaks = [s for s in r.subpeaks if s.fold_enrichment >= cut]
 
 
-def _apply_fdr(peaks: NestedPeakSet, params: CallParams) -> NestedPeakSet:
-    """BH across all regions, then across all sub-peaks, then threshold."""
+def _apply_fdr(peaks: NestedPeakSet, params: CallParams,
+               subpeaks=None) -> NestedPeakSet:
+    """BH across all regions, then across all sub-peaks, then threshold.
+
+    ``subpeaks``, if given, is called with the regions that passed (a
+    :class:`NestedPeakSet`) and fills in their sub-peaks; the sub-peak BH
+    family is then the sub-peaks of the reported regions.  Without it the
+    regions arrive with their sub-peaks and the family is every sub-peak
+    passed in (the focal pass).
+    """
     if len(peaks) == 0:
         return peaks
 
@@ -1486,19 +1819,51 @@ def _apply_fdr(peaks: NestedPeakSet, params: CallParams) -> NestedPeakSet:
         for r, q in zip(group, qs):
             r.neg_log10_q = float(q)
 
-    subs = [s for r in peaks.regions for s in r.subpeaks]
-    if subs:
-        sq = qvalue_from_neglog10p(np.array([s.neg_log10_p for s in subs]))
-        for s, q in zip(subs, sq):
-            s.neg_log10_q = float(q)
-
     cutoff = -np.log10(params.qvalue) if params.qvalue > 0 else 0.0
+
+    def _subpeak_fdr(regions) -> None:
+        subs = [s for r in regions for s in r.subpeaks]
+        if subs:
+            sq = qvalue_from_neglog10p(np.array([s.neg_log10_p for s in subs]))
+            for s, q in zip(subs, sq):
+                s.neg_log10_q = float(q)
+
+    if subpeaks is None:
+        _subpeak_fdr(peaks.regions)
     kept = peaks.filter(min_qvalue_score=cutoff, min_width=params.min_width,
                         min_fold=params.min_fold)
+    if subpeaks is not None:
+        subpeaks(kept)
+        _subpeak_fdr(kept.regions)
     # Drop sub-peaks that individually fail; the parent region can still pass.
     for r in kept.regions:
         r.subpeaks = [s for s in r.subpeaks if s.neg_log10_q >= cutoff]
     return kept
+
+
+def _cap_width(peaks: NestedPeakSet, max_width: int) -> Tuple[NestedPeakSet, int]:
+    """Replace regions wider than ``max_width`` by their sub-peaks.
+
+    See ``CallParams.max_width``.  Each sub-peak becomes a standalone
+    ``peak`` region carrying its own statistics (it passed the sub-peak FDR
+    against the region's level, so it is a focal feature in its own right);
+    a wide region with no sub-peaks is dropped.  Returns the new set and the
+    number of regions the cap acted on.
+    """
+    out: List[Region] = []
+    n = 0
+    for r in peaks.regions:
+        if r.width <= max_width:
+            out.append(r)
+            continue
+        n += 1
+        for sp in r.subpeaks:
+            out.append(Region(
+                chrom=sp.chrom, start=sp.start, end=sp.end, kind="peak",
+                score=sp.score, neg_log10_p=sp.neg_log10_p, neg_log10_q=sp.neg_log10_q,
+                fold_enrichment=sp.fold_enrichment, mean_posterior=r.mean_posterior,
+                subpeaks=[sp], source=r.source))
+    return NestedPeakSet(out, peaks.params, peaks.chrom_sizes), n
 
 
 def _merge_similar(intervals: Sequence[Tuple[int, int]], max_gap_bins: int,

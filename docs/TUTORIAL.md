@@ -1,8 +1,9 @@
 # Tutorial: A Tiny Reproducible FlexPeak Run
 
 This tutorial uses synthetic data generated from a fixed seed, so it is small,
-fast, and self-contained. The real-data integration test lives in
-[`testing/`](../testing/README.md) and downloads its public GEO input on demand.
+fast, and self-contained. An example on public data,
+[`examples/geo_h3k9me3.py`](../examples/geo_h3k9me3.py), downloads its GEO input
+on demand (see the last section).
 
 ## Install
 
@@ -62,13 +63,16 @@ a black outline, and there are no grid or other background lines inside it.
 
 ## Figures From Real Data
 
-The real-data test in [`testing/`](../testing/README.md) calls peaks on a public
+[`examples/geo_h3k9me3.py`](../examples/geo_h3k9me3.py) calls peaks on a public
 H3K9me3 bigWig (GEO GSE285245, mm10, chr19) and keeps four of its statistics
 figures here. Regenerate them with:
 
 ```bash
-python testing/run_geo_h3k9me3.py --quick --keep-figures
+python examples/geo_h3k9me3.py --quick --keep-figures
 ```
+
+The bigWig, the coverage cache and the results are written to
+`examples/geo_out/`, which is not version-controlled.
 
 The one-page summary: counts, width, enrichment, significance, and per-chromosome
 totals.

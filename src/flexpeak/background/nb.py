@@ -1,6 +1,6 @@
 """Negative binomial background model.
 
-DESIGN.md section 3.2.  MACS2's local Poisson lambda assumes mean == variance.
+DESIGN.md section 3.  MACS2's local Poisson lambda assumes mean == variance.
 Real ChIP/CUT&RUN background is overdispersed, so on noisy or shallow libraries
 a Poisson test reports wildly inflated significance and the reported FDR stops
 meaning anything.  Replacing it with a negative binomial whose dispersion is
@@ -24,11 +24,27 @@ from ..signal.coverage import Coverage
 from ..stats.nbtest import autocorrelation_inflation
 
 __all__ = ["BackgroundModel", "estimate_dispersion", "local_lambda",
-           "check_window_scale", "exclusion_smoothing_bp"]
+           "check_window_scale", "exclusion_smoothing_bp", "effective_windows"]
 
 
 #: Bins used to fit the dispersion trend and the autocorrelation inflation.
 _FIT_MAX_BINS = 4_000_000
+
+#: Chromosomes shorter than this many bins are fitted at full resolution
+#: (see the block-mean fit in ``local_lambda``): nothing to gain, and small
+#: test genomes keep their exact per-bin estimate.
+_COARSEN_MIN_BINS = 1_000_000
+
+#: Bins a per-chromosome summary statistic (a median, a quantile) is read
+#: from; longer arrays are strided down to about this many.
+_STAT_MAX_BINS = 2_000_000
+
+
+def _median(x: np.ndarray) -> float:
+    if x.size > _STAT_MAX_BINS:
+        x = x[:: int(np.ceil(x.size / _STAT_MAX_BINS))]
+    return float(np.median(x))
+
 
 #: Cap on the trimming-bias correction.  A larger value than this means the
 #: exclusion is removing most of the distribution, not its signal tail.
@@ -55,6 +71,12 @@ def _trim_correction(plain: np.ndarray, masked: np.ndarray, den: np.ndarray,
     estimator collapses back to the plain mean -- which is what keeps the null
     calibration intact.
     """
+    # The correction is one number per chromosome: a strided sample of a
+    # few million bins fixes it to three digits, and the quantile / median
+    # over every bin of a 10 bp chromosome was a third of the whole fit.
+    if den.size > _STAT_MAX_BINS:
+        step = int(np.ceil(den.size / _STAT_MAX_BINS))
+        plain, masked, den = plain[::step], masked[::step], den[::step]
     if quiet_min_den is not None:
         # Absolute rather than relative quietness.  At megabase windows on a
         # domain mark no window is free of signal, and "the quietest quarter"
@@ -164,8 +186,19 @@ def local_lambda(
     exclude_iters: int = 3,
     exclude_smooth_bp: Optional[int] = None,
     robust_start: bool = False,
+    unit: Optional[float] = None,
+    noise_z: float = 3.0,
+    info: Optional[dict] = None,
+    coarsen: bool = True,
 ) -> np.ndarray:
     """MACS-style local background: max over several window scales.
+
+    ``unit`` is the signal one fragment contributes (the track's total over
+    its fragment count; ~fragment length / bin size for a pileup).  It makes
+    the signal exclusion and the background floor count-aware -- see
+    ``_signal_threshold`` and the floor below.  None (a normalised track of
+    unknown depth) keeps the plain fold rule.  ``info``, if given, receives
+    ``held_out`` (bins the final pass set aside as signal) and ``n``.
 
     Taking the maximum is deliberately conservative -- it is what stops a caller
     from turning a broad swell of background into thousands of "peaks".
@@ -184,7 +217,7 @@ def local_lambda(
     quickly because each pass can only lower the estimate.  Set
     ``exclude_fold=0`` for the plain unmasked mean.
 
-    Measured on the CUT&RUN samples in ``testing/``: median fold enrichment in
+    Measured on CUT&RUN H3K27ac and H3K27me3 samples: median fold enrichment in
     the top 5% of bins rose 2.5x -> 8.0x (H3K27ac) and 3.6x -> 26.6x (H3K27me3),
     and H3K27me3 domains stopped being shredded into ~800 bp fragments.
 
@@ -211,6 +244,31 @@ def local_lambda(
     if exclude_smooth_bp is None:
         exclude_smooth_bp = exclusion_smoothing_bp(bin_size, windows)
     k_s = max(1, int(round(exclude_smooth_bp / bin_size)))
+
+    # Nothing below resolves anything finer than the judging scale: signal
+    # is judged on a k_s-bin mean and the background is a mean over windows
+    # at least ten times that.  On a long chromosome the fit is therefore
+    # run on block means of half the judging scale and interpolated back --
+    # the same estimate, k_s/2 times fewer bins through a dozen filters and
+    # six exclusion passes (a 10 bp human genome: 280 s of the call, serial).
+    c = k_s // 2
+    if coarsen and c >= 2 and arr32.size >= _COARSEN_MIN_BINS:
+        n = arr32.size
+        nb = n // c
+        blocks = arr32[: nb * c].reshape(nb, c).mean(axis=1)
+        if nb * c < n:
+            blocks = np.append(blocks, np.float32(arr32[nb * c:].mean()))
+        lam_c = local_lambda(
+            blocks, bin_size * c, windows, genome_mean,
+            exclude_fold=exclude_fold, exclude_iters=exclude_iters,
+            exclude_smooth_bp=exclude_smooth_bp, robust_start=robust_start,
+            # per-fragment signal, in units of the block MEAN
+            unit=(unit / c) if unit else unit, noise_z=noise_z, info=info,
+            coarsen=False)
+        centres = (np.arange(lam_c.size, dtype=np.float64) + 0.5) * c - 0.5
+        if nb * c < n:
+            centres[-1] = (nb * c + n - 1) / 2.0
+        return np.interp(np.arange(n, dtype=np.float64), centres, lam_c).astype(np.float32)
     judged = (uniform_filter1d(arr32, size=k_s, mode="nearest")
               if k_s > 1 else arr32)
 
@@ -234,28 +292,116 @@ def local_lambda(
     #   other two were being judged against, so it is the floor.
     #
     # The exclusion then iterates the window means against this fixed floor.
+    #
+    # "Not zero-inflated" needs more than a positive median on a sparse
+    # library.  Measured on a 7.5M-fragment ATAC library (hg38, 10 bp; 2.4
+    # fragments per kb): the median first turns positive at a smoothing
+    # scale holding about one fragment, where it reads 0.2 against a rate of
+    # 0.5 -- the median of a count with mean ~1 is not its mean.  With
+    # ``unit`` known the scale is widened until the median window holds
+    # ``_FLOOR_MIN_FRAGMENTS`` fragments, where median and mean agree to a
+    # few percent.
     k_f, judged_f = k_s, judged
     cap = max(1, int(max(windows) // bin_size)) if windows else k_s
-    while float(np.median(judged_f)) <= 0.0 and k_f < cap:
+    if unit:
+        cap = max(cap, int(np.ceil(4 * _FLOOR_MIN_FRAGMENTS * unit
+                                   / max(float(genome_mean), 1e-9))))
+        cap = max(1, min(cap, arr32.size // 4))
+    need = _FLOOR_MIN_FRAGMENTS * unit if unit else 0.0
+    med = _median(judged_f)
+    while k_f < cap and (med <= 0.0 or med * k_f < need):
         k_f = min(k_f * 2, cap)
         judged_f = uniform_filter1d(arr32, size=k_f, mode="nearest")
-    floor = max(min(floor, float(np.median(judged_f))), 1e-9)
+        med = _median(judged_f)
+    floor = max(min(floor, med), 1e-9)
     anchor = None
     if robust_start:
         anchor = _window_median(judged, bin_size, windows, floor)
         lam = anchor
     else:
         lam = _window_max(arr32, None, bin_size, windows, floor)
+    keep = None
     for _ in range(max(int(exclude_iters), 1) * 2):
         thr = lam if anchor is None else np.minimum(lam, anchor)
-        keep = (judged <= exclude_fold * thr).astype(np.float32)
+        keep = (judged <= _signal_threshold(thr, exclude_fold, k_s, unit, noise_z)
+                ).astype(np.float32)
         new = _window_max(arr32, keep, bin_size, windows, floor,
                           quiet_min_den=0.95 if robust_start else None)
         done = np.allclose(new, lam, rtol=0.01, atol=1e-6)
         lam = new
         if done:
             break
+    if info is not None and keep is not None:
+        info["held_out"] = info.get("held_out", 0) + int(keep.size - keep.sum())
+        info["n"] = info.get("n", 0) + int(keep.size)
     return lam
+
+
+#: Fragments the median smoothing window must hold before that median is read
+#: as the background level (see the floor in ``local_lambda``).
+_FLOOR_MIN_FRAGMENTS = 10.0
+
+#: Fragments a local-background window must be expected to hold (see
+#: ``effective_windows``).
+_WINDOW_MIN_FRAGMENTS = 20.0
+
+
+def _signal_threshold(level: np.ndarray, fold: float, k_s: int,
+                      unit: Optional[float], noise_z: float = 3.0) -> np.ndarray:
+    """Level above which the ``k_s``-bin smoothed track is held out as signal.
+
+    ``fold`` x the background alone is a statement about enrichment only when
+    the judged window holds enough fragments for noise not to reach it.  On a
+    sparse library it does not: at 2.4 fragments per kb a 100 bp window
+    expects 0.65 overlapping fragments, so ONE fragment is already twice the
+    background, every covered stretch is "signal", and the background is
+    fitted on the empty bins alone.  Measured on SNU449 ATAC (7-8M fragments,
+    hg38, 10 bp bins, 1/5/10 kb windows): 15-18% of the genome held out, the
+    fitted background at a median of 0.2 against a rate of 0.5, and the
+    genome then reads as 1.7-2x "domains" 10-600 kb wide.
+
+    So the threshold is the larger of the fold rule and the level plus
+    ``noise_z`` standard deviations of the judged mean under Poisson
+    fragments: a window of n expected fragments has sd sqrt(n) fragments,
+    i.e. ``sqrt(unit * level / k_s)`` in track units.  With nine or more
+    fragments in the window the fold rule is the larger one and nothing
+    changes; below that, what is held out has to be more than one fragment
+    of luck.
+    """
+    level = np.asarray(level, dtype=np.float32)
+    thr = np.float32(fold) * level
+    if unit and noise_z > 0:
+        noisy = level + np.float32(noise_z) * np.sqrt(
+            np.float32(unit / max(k_s, 1)) * np.maximum(level, 0))
+        thr = np.maximum(thr, noisy)
+    return thr
+
+
+def effective_windows(windows: Sequence[int], fragments_per_bp: Optional[float],
+                      bin_size: int,
+                      min_fragments: float = _WINDOW_MIN_FRAGMENTS) -> Tuple[int, ...]:
+    """The background windows widened to hold enough fragments to be a mean.
+
+    A local window is a rate estimate, and its error is set by the fragments
+    in it, not by its width in bp.  The 1 / 5 / 10 kb ladder is MACS's, sized
+    for a control library tens of millions of reads deep; MACS itself drops
+    the 1 kb window when there is no control.  At 2.4 fragments per kb a 1 kb
+    window holds two or three fragments: its mean is 0, 0.4, 0.8 ... x the
+    rate, and the max over windows takes whichever is highest, so the
+    background is noise that follows the reads.  Every window is therefore
+    raised to the width expected to hold ``min_fragments`` fragments at the
+    library's own rate; windows that collapse onto each other (within 25%)
+    are merged.  A deep library is unchanged.
+    """
+    wins = tuple(int(w) for w in windows)
+    if not wins or not fragments_per_bp or fragments_per_bp <= 0:
+        return wins
+    w_min = int(np.ceil(min_fragments / fragments_per_bp / bin_size)) * bin_size
+    out: list = []
+    for w in sorted(max(w, w_min) for w in wins):
+        if not out or w > 1.25 * out[-1]:
+            out.append(int(w))
+    return tuple(out)
 
 
 def estimate_dispersion(
@@ -400,6 +546,8 @@ class BackgroundModel:
         exclude_iters: int = 3,
         exclude_smooth_bp: Optional[int] = None,
         robust_start: bool = False,
+        depth_aware: bool = True,
+        n_jobs: Optional[int] = None,
     ) -> "BackgroundModel":
         """Fit the background.
 
@@ -407,43 +555,71 @@ class BackgroundModel:
         ----------
         control : matched input/IgG.  Optional by design -- no-control mode is
             first class, because most CUT&Tag data has no matched input
-            (DESIGN.md section 3.2).
+            (DESIGN.md section 3).
         covariates : ``{chrom: {name: array}}`` aligned to the treatment bins,
             e.g. mappability or GC.  Fitted by log-linear regression on
             background bins and applied multiplicatively.
+        depth_aware : size the windows and the signal exclusion by the
+            fragments they hold (``effective_windows``, ``_signal_threshold``)
+            when the track is a fragment pileup of known depth.  Off restores
+            the windows and the plain fold rule exactly as given (ablation).
+        n_jobs : worker processes, one chromosome each (``<= 0``: every CPU
+            allocated to this process; None/1: serial).
         """
         gmean = treatment.mean_signal()
         ctrl = control.scaled_to(treatment) if control is not None else None
 
-        mu: Dict[str, np.ndarray] = {}
-        for chrom, arr in treatment.bins.items():
-            if ctrl is not None and chrom in ctrl.bins:
-                # With a control, the local background comes from the CONTROL,
-                # never from the treatment.  Deriving it from the treatment
-                # makes every region its own background: for a domain wider
-                # than the largest window the estimate converges on the domain's
-                # own level and the fold enrichment collapses to ~1.  That is
-                # exactly how broad marks get lost.
-                c = ctrl.bins[chrom]
-                if c.size != arr.size:  # defensive: differing chrom lengths
-                    c = np.resize(c, arr.size)
-                lam = local_lambda(c, ctrl.bin_size, windows, gmean,
-                                   exclude_fold=exclude_fold,
-                                   exclude_iters=exclude_iters,
-                                   exclude_smooth_bp=exclude_smooth_bp,
-                                   robust_start=robust_start)
+        # The track the background is read from: the control where there is
+        # one, else the treatment.  Its depth decides how wide a window has
+        # to be and what one fragment looks like in track units.
+        requested = tuple(int(w) for w in windows)
+        src = ctrl if ctrl is not None else treatment
+        unit = frag_rate = None
+        if depth_aware and src.is_count and src.n_fragments:
+            tot, gbp = src.total_signal, float(src.effective_genome_size)
+            if tot > 0 and gbp > 0:
+                unit = tot / float(src.n_fragments)
+                frag_rate = float(src.n_fragments) / gbp
+        windows = effective_windows(requested, frag_rate, treatment.bin_size)
+        # The exclusion's judging scale follows the windows the caller asked
+        # for, not the widened ones: it is what keeps a held-out peak tight.
+        if exclude_smooth_bp is None:
+            exclude_smooth_bp = exclusion_smoothing_bp(treatment.bin_size, requested)
+
+        # With a control, the local background comes from the CONTROL, never
+        # from the treatment.  Deriving it from the treatment makes every
+        # region its own background: for a domain wider than the largest
+        # window the estimate converges on the domain's own level and the
+        # fold enrichment collapses to ~1.  That is exactly how broad marks
+        # get lost.  In no-control mode the treatment is the only estimate
+        # available, so the windows MUST be substantially wider than the
+        # features being called; presets for broad marks set them
+        # accordingly, and ``check_window_scale`` warns when they do not.
+        global _FIT_STATE
+        order = list(treatment.bins)
+        _FIT_STATE = dict(
+            treatment=treatment, ctrl=ctrl, windows=windows, gmean=gmean,
+            kw=dict(exclude_fold=exclude_fold, exclude_iters=exclude_iters,
+                    exclude_smooth_bp=exclude_smooth_bp, robust_start=robust_start,
+                    unit=unit),
+            min_mu=min_mu)
+        try:
+            jobs = _fit_jobs(n_jobs, len(order))
+            if jobs > 1:
+                import multiprocessing as mp
+                from concurrent.futures import ProcessPoolExecutor
+
+                todo = sorted(order, key=lambda c: -treatment.bins[c].size)
+                with ProcessPoolExecutor(max_workers=jobs,
+                                         mp_context=mp.get_context("fork")) as pool:
+                    done = dict(zip(todo, pool.map(_fit_chrom, todo)))
             else:
-                # No-control mode.  The treatment is the only background
-                # estimate available, so the windows MUST be substantially
-                # wider than the features being called or the same collapse
-                # occurs.  Presets for broad marks set windows accordingly, and
-                # ``check_window_scale`` warns when they do not.
-                lam = local_lambda(arr, treatment.bin_size, windows, gmean,
-                                   exclude_fold=exclude_fold,
-                                   exclude_iters=exclude_iters,
-                                   exclude_smooth_bp=exclude_smooth_bp,
-                                   robust_start=robust_start)
-            mu[chrom] = np.maximum(lam, min_mu).astype(np.float32)
+                done = {c: _fit_chrom(c) for c in order}
+        finally:
+            _FIT_STATE = None
+        mu: Dict[str, np.ndarray] = {c: done[c][0] for c in order}
+        held = sum(done[c][1].get("held_out", 0) for c in order)
+        held_n = sum(done[c][1].get("n", 0) for c in order)
 
         coef = None
         if covariates:
@@ -465,7 +641,7 @@ class BackgroundModel:
             for c in sorted(treatment.bins):
                 a = treatment.bins[c].astype(np.float32)
                 j = uniform_filter1d(a, size=ks, mode="nearest") if ks > 1 else a
-                kept.append(j <= exclude_fold * mu[c][: j.size])
+                kept.append(j <= _signal_threshold(mu[c][: j.size], exclude_fold, ks, unit))
             kept = np.concatenate(kept)
             if kept.sum() >= 10_000:
                 counts_bg, mu_bg = counts_all[kept], mu_all[kept]
@@ -511,15 +687,62 @@ class BackgroundModel:
                 # apparent signal.  A value near 0 means the exclusion did
                 # nothing; a value near 1 means it has eaten the background and
                 # the windows or the fold are wrong.
-                "excluded_fraction": float(
+                # Counted on the mask the last exclusion pass actually used
+                # (the smoothed track against its threshold), not on single
+                # bins against ``exclude_fold`` x mu: on a sparse library one
+                # fragment puts a bin over that, and the figure then reported
+                # the covered fraction of the genome (11-18% on ATAC whose
+                # open chromatin is 1-3%).
+                "excluded_fraction": (float(held / held_n) if held_n else float(
                     (c_fit > exclude_fold * m_fit).mean()
-                ) if exclude_fold > 0 else 0.0,
+                )) if exclude_fold > 0 else 0.0,
                 "exclude_smooth_bp": int(
                     exclude_smooth_bp
                     or exclusion_smoothing_bp(treatment.bin_size, windows)
                 ) if exclude_fold > 0 else 0,
+                "requested_windows": list(requested),
+                "windows": list(windows),
+                "signal_per_fragment": unit,
+                "fragments_per_kb": (frag_rate * 1000.0) if frag_rate else None,
             },
         )
+
+
+#: Set in the parent right before the worker pool forks (copy-on-write
+#: access to the coverage; only the fitted background comes back).
+_FIT_STATE: Optional[dict] = None
+
+
+def _fit_chrom(chrom: str):
+    st = _FIT_STATE
+    treatment, ctrl = st["treatment"], st["ctrl"]
+    arr = treatment.bins[chrom]
+    if ctrl is not None and chrom in ctrl.bins:
+        src = ctrl.bins[chrom]
+        if src.size != arr.size:  # defensive: differing chrom lengths
+            src = np.resize(src, arr.size)
+    else:
+        src = arr
+    info: dict = {}
+    lam = local_lambda(src, treatment.bin_size, st["windows"], st["gmean"],
+                       info=info, **st["kw"])
+    return np.maximum(lam, st["min_mu"]).astype(np.float32), info
+
+
+def _fit_jobs(n_jobs: Optional[int], n_chroms: int) -> int:
+    import multiprocessing as mp
+    import os
+
+    if n_jobs is None or n_jobs == 1 or n_chroms <= 1:
+        return 1
+    if "fork" not in mp.get_all_start_methods():
+        return 1
+    if n_jobs <= 0:
+        try:
+            n_jobs = len(os.sched_getaffinity(0))
+        except AttributeError:  # pragma: no cover - not Linux
+            n_jobs = os.cpu_count() or 1
+    return max(1, min(int(n_jobs), n_chroms))
 
 
 def _apply_covariates(

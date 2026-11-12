@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""One real-data integration test using a public GEO bigWig.
+"""Example on public data: H3K9me3 CUT&RUN from GEO (GSE285245, mm10).
 
-The bigWig is downloaded on demand and kept out of version control. This script
-is intentionally small: one public sample, one preset, and structural checks
-that catch broken I/O, invalid peak geometry, and unusable QC.
+Downloads one public bigWig on demand, calls peaks, and checks the result:
+the output files are written, the native TSV round-trips, regions are sorted
+and non-overlapping, and the QC values are in a sane range.
+
+    python examples/geo_h3k9me3.py --quick      # chr19 only
+    python examples/geo_h3k9me3.py              # chr1-19 and chrX
+
+Downloads, cache and results go to examples/geo_out/ (not version-controlled);
+--keep-figures also writes the tutorial figures to docs/figures/tutorial/.
 """
 
 from __future__ import annotations
@@ -15,6 +21,7 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+OUT = os.path.join(HERE, "geo_out")
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
 GEO_URL = (
@@ -52,10 +59,10 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--input", default=None,
                     help="existing bigWig path; skips download")
-    ap.add_argument("--data-dir", default=os.path.join(HERE, "data"),
+    ap.add_argument("--data-dir", default=os.path.join(OUT, "data"),
                     help="download directory, ignored by git")
-    ap.add_argument("--outdir", default=os.path.join(HERE, "results", "geo_h3k9me3"))
-    ap.add_argument("--cache-dir", default=os.path.join(HERE, "cache"))
+    ap.add_argument("--outdir", default=os.path.join(OUT, "results"))
+    ap.add_argument("--cache-dir", default=os.path.join(OUT, "cache"))
     ap.add_argument("--quick", action="store_true",
                     help="chr19 only; omit for chr1-19 plus chrX")
     ap.add_argument("--no-figures", action="store_true",

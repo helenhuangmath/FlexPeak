@@ -5,7 +5,7 @@ end)`` intervals.  No method is scored by its own output conventions, and no
 metric reads anything a method emits beyond its call intervals -- otherwise the
 comparison would measure score-column semantics rather than calls.
 
-Metric definitions follow docs/DESIGN.md section 9.4.
+Metric definitions follow docs/DESIGN.md section 11.
 """
 
 from __future__ import annotations

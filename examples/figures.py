@@ -6,7 +6,7 @@
 
 Every figure is produced by running FlexPeak, never by hand-entering numbers,
 so re-running this after a code change re-measures rather than re-draws.  Truth
-is known exactly here because the data is simulated (DESIGN.md section 9) --
+is known exactly here because the data is simulated (DESIGN.md section 11) --
 these are correctness figures, not performance claims about real data.
 
 Requires matplotlib (pip install matplotlib).
@@ -273,11 +273,11 @@ def fig1():
     if extra == 0 and hit == n_true:
         second = ("Sub-peaks inside a domain are tested against the domain's own "
                   "level and gated against the sample's distribution of candidate\n"
-                  "maxima (DESIGN.md §3.3), so background fluctuation on the "
+                  "maxima (DESIGN.md §6), so background fluctuation on the "
                   "plateau is not reported as structure.")
     else:
         second = ("Sub-peaks inside a domain are tested against the domain's own "
-                  "level (DESIGN.md §3.3); subpeak_domain_z and min_persistence\n"
+                  "level (DESIGN.md §6); subpeak_domain_z and min_persistence\n"
                   "trade the remaining false sub-peaks against sensitivity.")
     fig.subplots_adjust(bottom=0.21)
     fig.text(0.013, 0.10, first + "\n" + second,

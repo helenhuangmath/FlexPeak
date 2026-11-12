@@ -1,7 +1,7 @@
 """Synthetic ChIP-like data with known ground truth.
 
 Used by the test suite and by the worked examples.  It is also the seed of the
-evaluation harness (DESIGN.md section 9): a simulator where truth is known
+evaluation harness (DESIGN.md section 11): a simulator where truth is known
 exactly is the only place where precision and recall are unambiguous, so it is
 the right place to catch regressions before touching real data.
 

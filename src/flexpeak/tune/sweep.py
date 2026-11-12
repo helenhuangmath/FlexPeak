@@ -1,6 +1,6 @@
 """Runtime self-tuning: parameter sweep on a stratified chromosome subset.
 
-DESIGN.md section 8.  There is no pretrained model and no training corpus.  The
+DESIGN.md section 7.  There is no pretrained model and no training corpus.  The
 tuner learns from the sample in front of it:
 
   1. build coverage once on a stratified chromosome subset, cached
@@ -43,7 +43,7 @@ __all__ = ["TuneResult", "tune", "default_grid", "pick_tuning_chroms", "tuning_w
 
 
 def pick_tuning_chroms(cov: Coverage, n: int = 3, skip_largest: bool = False) -> List[str]:
-    """Stratified chromosome subset (DESIGN.md 7.5).
+    """Stratified chromosome subset (DESIGN.md 7).
 
     One large gene-dense, one mid/gene-poor, one small.  A single chromosome is
     not representative for broad marks, and chr1 alone biases toward gene-dense

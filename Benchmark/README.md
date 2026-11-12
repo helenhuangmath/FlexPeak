@@ -8,11 +8,11 @@ python Benchmark/run_benchmark.py     # ~7 min: run every method on every datase
 python Benchmark/make_figures.py      # render Benchmark/figures/
 ```
 
-> **This is not the benchmark specified in [docs/DESIGN.md §9–10](../docs/DESIGN.md).**
-> That one requires experimental data, held-out datasets and the published
-> software for every comparator. This is a controlled comparison on simulation,
-> and half the comparators are re-implementations rather than the real tools
-> (§2). It is a regression harness and a sanity check, not evidence for a paper.
+> **This is a controlled comparison on simulated data, not an evaluation on
+> experimental data** (see [docs/DESIGN.md §11–12](../docs/DESIGN.md)). Two of
+> the comparators are re-implementations rather than the published tools (§2).
+> It serves as a regression harness and a check of the method's behaviour
+> where the truth is known.
 
 ---
 
@@ -59,12 +59,12 @@ What the table says:
 5. **The self-tuner reproduces the defaults** on every dataset (within 1
    point) and costs about 3 s on this genome. The `h3k27me3` preset row
    fell on the low-quality set (67% -> 56%) when its background windows
-   were widened to 1 Mb / 5 Mb (DESIGN.md §15.3): on a 3 Mb simulated
+   were widened to 1 Mb / 5 Mb: on a 3 Mb simulated
    chromosome those windows degenerate to half-chromosome means. The
    presets are uncalibrated fallbacks; the widening was measured on
    experimental H3K27me3, where it is what makes weak domains callable. The quick scan (`--quick`) is
-   evaluated on experimental data in `testing/`, not here: on simulation the
-   defaults are already the right answer.
+   not evaluated here: on simulation the defaults are already the right
+   answer, so its benefit can only be seen on experimental data.
 
 ![F1 heatmap](figures/B1_f1_heatmap.png)
 
@@ -109,7 +109,7 @@ for I/O would flatter it (§5.5).
 
 ### 3.2 Fairness measures
 
-Following [DESIGN.md §10.2](../docs/DESIGN.md):
+Following [DESIGN.md §11](../docs/DESIGN.md):
 
 - All methods run at nominal FDR 5%. Matched call count is not enforced;
   territory is reported alongside every recall number instead.
@@ -165,7 +165,7 @@ stops the symmetric failure of calling almost nothing, and a strict setting
 that keeps only the strongest focal peaks is perfectly stable. On mixed data the
 tuner duly chose F1 7% while scoring that setting's stability at 0.98.
 
-The objective is now anchored by a **held-out fit** term (DESIGN.md §3.4,
+The objective is now anchored by a **held-out fit** term (DESIGN.md §7,
 `flexpeak.tune.objective`): the reads are split into two halves, calls are
 made on one, each called piece's fold is read off that half, and the score is
 how much better that piecewise enrichment explains the *other* half's reads
@@ -271,7 +271,7 @@ End to end, with BAM parsing charged to both:
 FlexPeak is ~1.7x faster than MACS2 end to end on this genome, and the
 self-tuner (27 grid points, two read halves each) costs about 3 s on top.
 SICER2 is the slowest comparator (its window scoring is pure Python). The
-speed work that produced this is recorded in DESIGN.md §7: the BAM is scanned
+speed work that produced this is summarised in DESIGN.md §10: the BAM is scanned
 once into fragment-anchor arrays and binned with `bincount`; the HMM's
 gamma-function coefficient is computed once per chromosome; sub-peak
 candidates are tested in one vectorised call; and the tuner fits the
@@ -297,8 +297,8 @@ never touch a BAM.
    fold floor, the segmentation-bin floor and the sub-peak gate), each
    measured on these same five datasets plus smaller simulations in the test
    suite. They are principled and documented in `CallParams`, but they were
-   chosen with these results in view; the held-out numbers that would show
-   they generalise are the experimental data in `testing/`, not this table.
+   chosen with these results in view; showing that they generalise requires
+   experimental data, not this table.
 5. **A 4.5 Mb genome** is three orders of magnitude smaller than a real one. The
    runtime figure is a smoke test; it says nothing about scaling.
 6. **The evaluation code is part of the FlexPeak repository.** It was written
@@ -357,8 +357,8 @@ What the table says:
   69% of the genome. The simulated input shares the treatment's baseline
   drift exactly, which is the case input normalisation is meant for, so
   this is not an unfair input. THOR 1.0.2 needed a source patch to run
-  under numpy >= 2 (`cluster/00_install_env.sbatch`), as did SICER2's
-  `sicer_df`.
+  under numpy >= 2, as did SICER2's `sicer_df` (the patches replace
+  deprecated NumPy calls and do not change either tool's results).
 
 Threats to validity are the same as in section 6 -- simulated data from the
 model family FlexPeak assumes, one replicate per setting, evaluation code in

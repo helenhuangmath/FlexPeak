@@ -1,6 +1,6 @@
 """Negative binomial HMM for domain segmentation.
 
-DESIGN.md section 3.3, layer 1.  Three states -- background, weak-enriched,
+DESIGN.md section 4.  Three states -- background, weak-enriched,
 strong-enriched -- with non-homogeneous emissions: state ``k`` at bin ``i`` has
 mean ``mu_i * m_k``, where ``mu_i`` is the fitted local background.  That keeps
 the mappability/GC/control structure of the background model inside the
@@ -10,7 +10,7 @@ Boundaries are *inferred* from the posterior rather than set by a ``--gap-size``
 guess.  Over-merging is what a fixed gap parameter produces when the gap is
 larger than the true inter-domain spacing, and it is the specific failure of
 SICER/epic2 that this design is meant to fix.  The corresponding metric is the
-fusion index (DESIGN.md section 9.4).
+fusion index (DESIGN.md section 11).
 """
 
 from __future__ import annotations
@@ -59,6 +59,10 @@ class NBHMM:
         min_stay_enriched: float = 0.0,
         fit_state_dispersion: bool = False,
         max_dispersion_scale: float = 50.0,
+        decode_path: bool = True,
+        fit_fraction: float = 1.0,
+        fit_block: int = 20_000,
+        fit_min_bins: int = 400_000,
     ):
         self.n_states = n_states
         self.multipliers = np.array(
@@ -73,6 +77,25 @@ class NBHMM:
         self.background_slack = background_slack
         self.fit_state_dispersion = bool(fit_state_dispersion)
         self.max_dispersion_scale = float(max_dispersion_scale)
+        self.decode_path = bool(decode_path)
+        """Also return the Viterbi path (``HMMResult.state``).  The caller
+        works from the posterior alone, so it switches this off: the path is
+        one more full pass over the chromosome for a result nothing reads."""
+        self.fit_fraction = float(fit_fraction)
+        self.fit_block = int(fit_block)
+        self.fit_min_bins = int(fit_min_bins)
+        """Baum-Welch on a sample of the chromosome, posterior on all of it.
+
+        The EM estimates three multipliers and a 3 x 3 transition matrix; a
+        chromosome of millions of bins fixes them long before every bin has
+        been visited ten times.  With ``fit_fraction < 1`` the iterations run
+        on evenly spaced contiguous blocks of ``fit_block`` bins covering
+        that fraction of a chromosome longer than ``fit_min_bins`` (the
+        blocks are concatenated: one artificial junction per block against
+        ~``fit_block`` real transitions-in-waiting), and the final
+        forward-backward pass, which is what the calls are made from, runs
+        on the whole chromosome with the fitted parameters.  1.0: every
+        iteration on every bin."""
         """Re-fit each state's dispersion, as a multiple of the background trend.
 
         The background model fits its mean-dispersion trend on background bins,
@@ -102,7 +125,7 @@ class NBHMM:
 
         Baum-Welch re-estimates the transition matrix, and on real coverage it
         reliably collapses the enriched dwell time: measured on the CUT&RUN
-        samples in ``testing/`` it learned self-transitions of 0.60-0.86, i.e. a
+        samples it learned self-transitions of 0.60-0.86, i.e. a
         mean enriched run of 63-720 bp, on marks whose own autocorrelation
         length is 0.9-7.4 kb.  The reason is that inside a real domain
         individual bins fluctuate below the enriched mean, and a free transition
@@ -224,6 +247,18 @@ class NBHMM:
         converged = False
         it = 0
 
+        # What the EM iterates on: the chromosome, or a block sample of it.
+        full = (counts, mu, alpha)
+        sampled = False
+        if 0.0 < self.fit_fraction < 1.0 and n >= self.fit_min_bins:
+            block = max(1000, self.fit_block)
+            stride = max(block, int(round(block / self.fit_fraction)))
+            starts = np.arange(0, n - block + 1, stride)
+            if starts.size >= 4:
+                idx = (starts[:, None] + np.arange(block)[None, :]).ravel()
+                counts, mu, alpha = counts[idx], mu[idx], np.asarray(alpha)[idx]
+                sampled = True
+
         disp = np.ones(self.n_states)
         cache: dict = {}
         for it in range(1, self.max_iter + 1):
@@ -268,9 +303,13 @@ class NBHMM:
                 break
             prev_ll = ll
 
+        if sampled:
+            counts, mu, alpha = full
+            cache = {}
         log_e = self._log_emissions(counts, mu, alpha, mult, disp, cache)
         gamma, _, _ = self._forward_backward(log_e, A, pi)
-        path = self._viterbi(log_e, A, pi)
+        path = (self._viterbi(log_e, A, pi) if self.decode_path
+                else np.zeros(0, dtype=np.int16))
         posterior = 1.0 - gamma[0]
         return HMMResult(
             posterior=posterior,

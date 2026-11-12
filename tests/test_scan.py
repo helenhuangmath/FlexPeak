@@ -118,4 +118,6 @@ def test_scan_window_and_finer_cache_reuse(tmp_path):
     coarse = load_signal(bw, bin_size=100, cache_dir=cdir)      # served by rebinning the 25 bp cache
     assert coarse.bin_size == 100
     assert np.allclose(coarse.bins["chr1"], fine.rebin(100).bins["chr1"])
-    assert len(list(cdir.glob("*.100bp.*.npz"))) == 1
+    # Rebinned in memory: the derived coverage is not written as a second cache.
+    assert len(list(cdir.glob("*.100bp.*.npz"))) == 0
+    assert len(list(cdir.glob("*.25bp.*.npz"))) == 1

@@ -2,7 +2,7 @@
 
 Paired-end reads become real fragments.  Single-end reads are extended by a
 fragment length estimated from strand cross-correlation, which is also the
-NSC/RSC QC statistic (DESIGN.md section 5).
+NSC/RSC QC statistic (DESIGN.md section 9).
 
 The file is read **once**.  Each chromosome is scanned into two integer arrays
 of fragment anchors -- forward starts and reverse ends for single-end data,
@@ -14,7 +14,7 @@ load from 5.8 s to under 1.5 s; most of the old cost was a second full pass for
 the fragment-length estimate that indexed a NumPy array once per read.
 
 Chromosomes are independent, so on large files they are scanned in worker
-processes (DESIGN.md section 7).
+processes (DESIGN.md section 10).
 """
 
 from __future__ import annotations
@@ -314,11 +314,23 @@ def load_bam(
 
     bins: Dict[str, np.ndarray] = {}
     n_frag = 0
+    # Paired-end fragment-size histogram (1 bp, 0..max_fragment): the
+    # nucleosome ladder is the ATAC library QC, and it is free here.
+    size_hist = np.zeros(max_fragment + 1, dtype=np.int64) if paired else None
     for chrom in wanted:
         a, b = scans.pop(chrom)
         starts, ends = _fragments(a, b, bool(paired), int(frag_len or 0))
         bins[chrom] = _bin_fragments(starts, ends, sizes[chrom], bin_size)
         n_frag += int(starts.size)
+        if size_hist is not None and starts.size:
+            size_hist += np.bincount(np.clip(ends - starts, 0, max_fragment),
+                                     minlength=max_fragment + 1)
+    meta = {"paired": bool(paired), "mapq": mapq,
+            # Strand cross-correlation is a single-end statistic; for
+            # paired-end data it is not computed, which is not the same as 0.
+            "nsc": None if paired else nsc}
+    if size_hist is not None:
+        meta["fragment_sizes"] = size_hist.tolist()
 
     return Coverage(
         bins=bins,
@@ -328,7 +340,7 @@ def load_bam(
         is_count=True,
         n_fragments=n_frag,
         fragment_length=frag_len,
-        meta={"paired": bool(paired), "mapq": mapq, "nsc": nsc},
+        meta=meta,
     )
 
 

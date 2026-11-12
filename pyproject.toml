@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flexpeak"
-version = "0.1.0"
+version = "1.1.0"
 description = "Flexible, adaptive peak calling for ChIP-seq / CUT&RUN / CUT&Tag / ATAC-seq"
 readme = "README.md"
 requires-python = ">=3.9"

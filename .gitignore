@@ -6,13 +6,10 @@ __pycache__/
 .DS_Store
 build/
 examples/tutorial_out/
+examples/geo_out/
+.flexpeak_cache/
 
-# Heavy or transient material lives in ../FlexPeak_work (symlinked here; never committed)
-testing/data
-testing/results
-testing/cache
-cluster/logs
-tmp
+# Benchmark inputs and raw outputs live outside the repository (symlinked here)
 Benchmark/data
 Benchmark/data_diff
 Benchmark/results/macs_raw

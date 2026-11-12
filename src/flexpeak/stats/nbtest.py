@@ -107,9 +107,18 @@ def autocorrelation_length_bp(signal, bin_size: int, max_lag_bp: int = 200_000,
     Computed by FFT: the direct lag-by-lag loop is O(n * max_lag), which on a
     chromosome at 25 bp bins is billions of operations for a number used once.
     """
-    x = np.asarray(signal, dtype=np.float64).ravel()
-    if x.size > max_bins:  # a strided sample is plenty for a scale estimate
-        x = x[:: int(np.ceil(x.size / max_bins))]
+    x = np.asarray(signal).ravel()
+    if x.size > max_bins:
+        # A contiguous block from the middle of the array, not a strided
+        # sample.  Striding by s keeps every s-th bin, so a lag of one in the
+        # sample is s bins of the signal and the length came back s times too
+        # short: on 10 bp ATAC coverage chr1 (stride 7) read 100 bp against
+        # 610 bp on the block, chr8 (stride 4) 170 against 430.  Only arrays
+        # longer than ``max_bins`` were ever affected -- chromosomes at 10 bp
+        # bins, and the largest ones at 25 bp.
+        mid = (x.size - max_bins) // 2
+        x = x[mid: mid + max_bins]
+    x = x.astype(np.float64)
     if x.size < 32:
         return int(bin_size)
     x = x - x.mean()

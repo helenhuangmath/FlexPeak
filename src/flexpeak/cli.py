@@ -44,17 +44,27 @@ def _add_input_args(p):
                    help="control/input/IgG BAM or bigWig (optional; no-control "
                         "mode is fully supported)")
     p.add_argument("--chroms", default=None,
-                   help="comma-separated chromosome subset")
+                   help="comma-separated chromosome subset (default: the "
+                        "assembled chromosomes -- unplaced / random / alt "
+                        "contigs, chrM and EBV are left out)")
+    p.add_argument("--all-contigs", action="store_true",
+                   help="also call on unplaced, random and alt contigs "
+                        "(everything in the file except chrM and EBV)")
     p.add_argument("--bin-size", type=int, default=None,
                    help="bin size in bp (default: from preset, else 25)")
     p.add_argument("--mapq", type=int, default=30, help="minimum MAPQ for BAM input")
     p.add_argument("--threads", type=int, default=0,
-                   help="worker processes for reading a BAM, one chromosome "
-                        "each (default 0: automatic -- up to 8 on a large file, "
-                        "serial on a small one)")
+                   help="worker processes, one chromosome each, for reading a "
+                        "BAM and for the peak call itself (default 0: automatic "
+                        "-- every CPU allocated to the job for the call; up to 8 "
+                        "for a large BAM, serial for a small one)")
     p.add_argument("--blacklist", default=None,
                    help="BED of artefact regions to drop calls in (e.g. the "
                         "ENCODE mm10 exclusion list); .bed or .bed.gz")
+    p.add_argument("--tss", default=None, metavar="GTF|BED",
+                   help="gene annotation (GTF/GFF) or TSS BED: adds the TSS "
+                        "enrichment score to the QC report (the ATAC "
+                        "signal-to-background metric)")
     p.add_argument("--no-cache", action="store_true",
                    help="do not read/write the coverage cache")
     p.add_argument("--cache-dir", default=None,
@@ -96,6 +106,18 @@ def build_parser() -> argparse.ArgumentParser:
                     help="hold bins above this fold out of the local background "
                          "fit (default 2.0; 0 = plain windowed mean, the "
                          "ablation -- expect broad domains to be shredded)")
+    cp.add_argument("--dispersion", default=None, metavar="A0,A1",
+                    help="pin the per-bin dispersion trend alpha = a0 + a1/mu "
+                         "instead of fitting it on this sample -- e.g. the median "
+                         "over the libraries of one experiment (see <name>_qc.json), "
+                         "so replicates are tested under one noise model")
+    cp.add_argument("--segment-dispersion", default=None, metavar="A0,A1",
+                    help="pin the dispersion trend of the segmentation-bin sums "
+                         "(what the HMM segments with) the same way")
+    cp.add_argument("--max-width", type=int, default=None,
+                    help="widest region reported, bp; a wider one is reported as "
+                         "its sub-peaks (default: 50000 with --preset atac, else "
+                         "no cap; 0 = no cap)")
     cp.add_argument("--windows", default=None,
                     help="comma-separated local-background windows in bp, e.g. "
                          "1000,5000,10000 (MACS) or 1000000,5000000 (domain marks); "
@@ -118,6 +140,11 @@ def build_parser() -> argparse.ArgumentParser:
                          "--bin-size (default: the mark's autocorrelation "
                          "length / 8; set equal to --bin-size to segment at "
                          "reporting resolution)")
+    cp.add_argument("--hmm-fit-fraction", type=float, default=None,
+                    help="share of each chromosome the HMM's EM iterations run "
+                         "on (evenly spaced blocks); the posterior is always "
+                         "computed on the whole chromosome (default 1.0; 0.25 "
+                         "with --preset atac)")
     cp.add_argument("--no-dwell-floor", action="store_true",
                     help="ablation: let Baum-Welch re-estimate the HMM dwell "
                          "time freely instead of flooring it at the signal's "
@@ -149,11 +176,21 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("--scan-sd", type=float, default=5.0,
                     help="bins beyond this many SD of the clipped background "
                          "are candidate signal in the quick scan (default 5)")
-    cp.add_argument("--figures", action="store_true",
-                    help="also write the basic statistics figures (PDF, Arial) "
-                         "into <outdir>/figures/ -- requires matplotlib")
+    cp.add_argument("--keep-cache", action="store_true",
+                    help="keep the binned-coverage cache after the run, so that "
+                         "calling the same input again skips reading it (by "
+                         "default the cache is deleted when the run ends)")
+    cp.add_argument("--figures", nargs="?", const="qc", default=None,
+                    choices=("qc", "all"),
+                    help="write the QC figure <name>_qc.pdf: one page with the "
+                         "call summary, width and enrichment distributions, "
+                         "per-chromosome counts and, where available, the "
+                         "fragment-size ladder and the TSS profile.  "
+                         "'--figures all' writes every statistics figure into "
+                         "<outdir>/figures/ instead.  Requires matplotlib")
     cp.add_argument("--figure-dir", default=None,
-                    help="where --figures writes (default: <outdir>/figures)")
+                    help="where --figures writes (default: <outdir>, or "
+                         "<outdir>/figures for 'all')")
     cp.add_argument("--quiet", action="store_true")
 
     # -- tune ----------------------------------------------------------------
@@ -262,7 +299,8 @@ def _load(args, path, bin_size, chroms):
         kw["n_jobs"] = getattr(args, "threads", 0)
     return load_signal(path, bin_size=bin_size, chroms=chroms,
                        cache=not args.no_cache,
-                       cache_dir=getattr(args, "cache_dir", None), **kw)
+                       cache_dir=getattr(args, "cache_dir", None),
+                       primary_only=not getattr(args, "all_contigs", False), **kw)
 
 
 def _resolve_params(args):
@@ -283,11 +321,24 @@ def _resolve_params(args):
     bxf = getattr(args, "background_exclude_fold", None)
     if bxf is not None:
         params = params.replace(background_exclude_fold=bxf)
+    hff = getattr(args, "hmm_fit_fraction", None)
+    if hff is not None:
+        params = params.replace(hmm_fit_fraction=hff)
     if getattr(args, "no_dwell_floor", False):
         params = params.replace(dwell_from_autocorrelation=False)
     sbs = getattr(args, "segment_bin_size", None)
     if sbs is not None:
         params = params.replace(segment_bin_size=sbs)
+    for attr in ("dispersion", "segment_dispersion"):
+        v = getattr(args, attr, None)
+        if v:
+            pair = tuple(float(x) for x in str(v).split(","))
+            if len(pair) != 2:
+                raise SystemExit(f"flexpeak: error: --{attr.replace('_', '-')} takes A0,A1")
+            params = params.replace(**{attr: pair})
+    mw = getattr(args, "max_width", None)
+    if mw is not None:
+        params = params.replace(max_width=mw or None)
     win = getattr(args, "windows", None)
     if win:
         params = params.replace(windows=tuple(int(w) for w in str(win).split(",") if w.strip()))
@@ -303,6 +354,33 @@ def _resolve_params(args):
 
 
 def cmd_callpeak(args) -> int:
+    """``callpeak``, then remove the coverage caches it read or wrote.
+
+    The cache only pays off when the same input is called again; after a
+    finished run it is disk space (tens of MB per library at 10 bp).  It is
+    removed whether the run succeeded or failed, unless ``--keep-cache``.
+    """
+    try:
+        return _callpeak(args)
+    finally:
+        if not args.no_cache and not getattr(args, "keep_cache", False):
+            _remove_run_caches(args)
+
+
+def _remove_run_caches(args) -> None:
+    from .io.load import remove_caches
+
+    inputs = [args.treatment, args.control] + list(getattr(args, "replicates", None) or [])
+    n = 0
+    for f in inputs:
+        if f:
+            n += len(remove_caches(f, args.cache_dir))
+    if n and not args.quiet:
+        print(f"[flexpeak] removed {n} coverage cache file(s) "
+              f"(--keep-cache keeps them for a rerun)", file=sys.stderr)
+
+
+def _callpeak(args) -> int:
     import os
 
     from .caller import call_peaks
@@ -312,6 +390,7 @@ def cmd_callpeak(args) -> int:
     chroms = args.chroms.split(",") if args.chroms else None
     params = _resolve_params(args)
     say = (lambda *a: None) if args.quiet else (lambda *a: print(*a, file=sys.stderr))
+    tss_future = _start_tss_reader(args)
 
     grid = None
     scan_rec = None
@@ -388,10 +467,18 @@ def cmd_callpeak(args) -> int:
         blacklist = read_bed_intervals(args.blacklist)
         say(f"[flexpeak] blacklist: {len(blacklist)} regions from {args.blacklist}")
 
+    import time as _time
+
+    jobs = getattr(args, "threads", 0)
     say("[flexpeak] calling peaks ...")
+    _t0 = _time.perf_counter()
     result = call_peaks(treat, ctrl, params, name=args.name, blacklist=blacklist,
-                        return_details=True)
+                        return_details=True, n_jobs=getattr(args, "threads", 0))
     peaks = result.peaks
+    tm = result.diagnostics.get("timing") or {}
+    if tm:
+        say(f"[flexpeak]   called in {_time.perf_counter() - _t0:.1f} s ("
+            + ", ".join(f"{k} {v:.1f}" for k, v in tm.items()) + ")")
     if scan_rec is not None:
         peaks.params["scan"] = {
             "class": scan_rec.signal_class, "scale_bp": scan_rec.scale_bp,
@@ -411,16 +498,43 @@ def cmd_callpeak(args) -> int:
     prefix = os.path.join(args.outdir, args.name)
     paths = peaks.write_all(prefix)
 
-    m = qc_metrics(treat, peaks, ctrl, result.background)
+    # One QC report per run: library and call-set statistics together, as
+    # text and as JSON.  (``flexpeak stats`` still writes the separate
+    # summary and the full figure set for a call set on disk.)
+    import json
+
+    from .plots.stats import format_stats, peak_stats
+
+    _t1 = _time.perf_counter()
+    m = qc_metrics(treat, peaks, ctrl, result.background, **_qc_kw(args, tss_future))
+    m["timing_s"] = {k: round(v, 2) for k, v in tm.items()}
+    calls = peak_stats(peaks) if len(peaks) else None
     with open(f"{prefix}_qc.txt", "w") as fh:
         fh.write(format_qc(m) + "\n")
-    paths.update(_write_summary(peaks, prefix))
+        if calls:
+            fh.write("\n" + format_stats(calls) + "\n")
+    with open(f"{prefix}_qc.json", "w") as fh:
+        json.dump(dict(m, calls=calls), fh, indent=2, default=str)
+        fh.write("\n")
+    paths["qc"] = f"{prefix}_qc.txt"
+    paths["qc_json"] = f"{prefix}_qc.json"
+    say(f"[flexpeak]   outputs written in {_t1 - _t0 - sum(tm.values()):.1f} s, "
+        f"QC {_time.perf_counter() - _t1:.1f} s")
 
     if args.figures:
-        say("[flexpeak] drawing statistics figures ...")
-        figdir = args.figure_dir or os.path.join(args.outdir, "figures")
         try:
-            paths.update(_write_figures(peaks, figdir, args.name, args.treatment))
+            if args.figures == "all":
+                say("[flexpeak] drawing every statistics figure ...")
+                figdir = args.figure_dir or os.path.join(args.outdir, "figures")
+                paths.update(_write_figures(peaks, figdir, args.name, args.treatment))
+            else:
+                from .plots.stats import qc_figure
+
+                figdir = args.figure_dir or args.outdir
+                title = f"FlexPeak QC -- {args.name}"
+                paths["fig:qc"] = qc_figure(
+                    peaks, os.path.join(figdir, f"{args.name}_qc.pdf"), title=title,
+                    qc=dict(m, fragment_sizes=treat.meta.get("fragment_sizes")))
         except (ImportError, ValueError) as e:
             # A missing matplotlib must not throw away a completed call whose
             # outputs are already on disk.
@@ -433,7 +547,6 @@ def cmd_callpeak(args) -> int:
         f"({peaks.n_domains} domains, {peaks.n_subpeaks} subpeaks)")
     for k, v in paths.items():
         say(f"[flexpeak]   {k:<24} {v}")
-    say(f"[flexpeak]   {'qc':<24} {prefix}_qc.txt")
     if not treat.is_count:
         say("[flexpeak] NOTE: bigWig input is not raw counts; p-values are approximate.")
     return 0
@@ -546,12 +659,50 @@ def cmd_qc(args) -> int:
         if len(peaks) == 0:
             print(f"flexpeak: error: no regions in {args.peaks}", file=sys.stderr)
             return 1
-        m = qc_metrics(treat, peaks, ctrl)
+        m = qc_metrics(treat, peaks, ctrl, **_qc_kw(args))
     else:
-        result = call_peaks(treat, ctrl, params, return_details=True)
-        m = qc_metrics(treat, result.peaks, ctrl, result.background)
+        result = call_peaks(treat, ctrl, params, return_details=True,
+                            n_jobs=getattr(args, "threads", 0))
+        m = qc_metrics(treat, result.peaks, ctrl, result.background, **_qc_kw(args))
     print(json.dumps(m, indent=2, default=str) if args.json else format_qc(m))
     return 0
+
+
+def _start_tss_reader(args):
+    """Begin parsing ``--tss`` in a side process and return its future.
+
+    A genome annotation is a 1-2 GB text file and parsing it is several
+    seconds of pure waiting at the end of the run; started here, before
+    anything large is in memory, it is done long before the QC asks for it.
+    None when there is nothing to read or no ``fork`` to do it with.
+    """
+    import multiprocessing as mp
+
+    if not getattr(args, "tss", None) or "fork" not in mp.get_all_start_methods():
+        return None
+    from concurrent.futures import ProcessPoolExecutor
+
+    from .qc.metrics import read_tss
+
+    pool = ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("fork"))
+    fut = pool.submit(read_tss, args.tss)
+    pool.shutdown(wait=False)
+    return fut
+
+
+def _qc_kw(args, tss_future=None):
+    """Assay-specific QC inputs: only what was asked for, so the default
+    report is unchanged."""
+    kw = {}
+    preset = (getattr(args, "preset", None) or "").lower()
+    if preset == "atac":
+        kw["assay"] = "atac"
+    tss = getattr(args, "tss", None)
+    if tss:
+        from .qc.metrics import read_tss
+
+        kw["tss"] = tss_future.result() if tss_future is not None else read_tss(tss)
+    return kw
 
 
 def _scan_bins(args):

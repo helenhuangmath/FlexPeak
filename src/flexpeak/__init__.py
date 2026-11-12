@@ -4,7 +4,7 @@ No pretrained model, no training corpus, no ML dependency -- adaptivity comes
 from per-sample self-tuning at runtime.  See docs/DESIGN.md.
 """
 
-__version__ = "0.1.0"
+__version__ = "1.1.0"
 
 from .peaks import NestedPeakSet, Region, SubPeak
 from .signal.coverage import Coverage

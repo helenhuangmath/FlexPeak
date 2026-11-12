@@ -27,7 +27,7 @@ from .style import (
     MUTED, S1, S2, S3, SURFACE, TITLE_PAD, apply_style, finish, footnote, savefig,
 )
 
-__all__ = ["peak_stats", "peak_stat_figures", "format_stats"]
+__all__ = ["peak_stats", "peak_stat_figures", "format_stats", "qc_figure"]
 
 
 # -- numbers ----------------------------------------------------------------
@@ -639,8 +639,32 @@ def fig_subpeaks_per_region(peaks, s, plt, path):
     return savefig(fig, path)
 
 
-def fig_summary(peaks, s, plt, path, title=None):
-    """One page: the numbers plus the four distributions that matter most."""
+def _qc_rows(qc: Dict) -> List:
+    """Library-QC lines for the numbers panel, from ``qc_metrics`` output."""
+    rows = []
+    if qc.get("n_fragments"):
+        rows.append(("fragments", f"{qc['n_fragments'] / 1e6:,.1f} M"))
+    if qc.get("frip") is not None:
+        rows.append(("FRiP", f"{qc['frip']:.3f}"))
+    if qc.get("tss_enrichment") is not None:
+        rows.append(("TSS enrichment", f"{qc['tss_enrichment']:.1f}"))
+    if qc.get("nucleosome_free_fraction") is not None:
+        rows.append(("nucleosome-free fragments", f"{qc['nucleosome_free_fraction']:.0%}"))
+    if qc.get("grade"):
+        rows.append(("quality grade", str(qc["grade"])))
+    return rows
+
+
+def fig_summary(peaks, s, plt, path, title=None, qc=None):
+    """One page: the numbers plus the distributions that matter most.
+
+    With ``qc`` (the ``qc_metrics`` dictionary, plus ``fragment_sizes`` when
+    the library is paired-end) the page is the run's single QC figure: the
+    library numbers join the summary, the fragment-size ladder takes the
+    place of the significance histogram and the TSS profile sits beside the
+    per-chromosome counts.
+    """
+    qc = qc or {}
     fig = plt.figure(figsize=(15.0, 9.0))
     gs = fig.add_gridspec(2, 3, hspace=0.52, wspace=0.28,
                           left=0.06, right=0.975, top=0.855, bottom=0.09)
@@ -648,13 +672,14 @@ def fig_summary(peaks, s, plt, path, title=None):
     # -- numbers panel
     ax = fig.add_subplot(gs[0, 0])
     ax.axis("off")
-    y = 1.0
-    for label, fn in _SUMMARY_ROWS:
+    rows = [(label, fn(s)) for label, fn in _SUMMARY_ROWS] + _qc_rows(qc)
+    y, dy = 1.0, min(0.083, 1.0 / max(len(rows), 1))
+    for label, value in rows:
         ax.text(0.0, y, label, fontsize=FS_NOTE, color=INK, va="top",
                 transform=ax.transAxes)
-        ax.text(1.0, y, fn(s), fontsize=FS_NOTE, color=INK, va="top", ha="right",
+        ax.text(1.0, y, value, fontsize=FS_NOTE, color=INK, va="top", ha="right",
                 transform=ax.transAxes)
-        y -= 0.083
+        y -= dy
     ax.set_title("Summary", loc="left", pad=12)
 
     # -- width
@@ -680,28 +705,58 @@ def fig_summary(peaks, s, plt, path, title=None):
     finish(ax, xlabel="fold enrichment", ylabel="count")
     ax.set_title("Enrichment", loc="left", pad=12)
 
-    # -- significance
+    sizes = qc.get("fragment_sizes")
+    profile = qc.get("tss_profile")
     ax = fig.add_subplot(gs[1, 0])
-    qs = _cap_infinite(np.array([r.neg_log10_q for r in peaks], dtype=np.float64))
-    ax.hist(qs, bins=np.linspace(0, max(float(qs.max()) if qs.size else 1.0, 1.0), 28),
-            color=S2, edgecolor=SURFACE, linewidth=0.7)
-    ax.grid(axis="x", visible=False)
-    # Say so on the axis: the right-edge spike is q underflowing to zero, not a
-    # real mode, and this panel has no room for a footnote.
-    xlab = "-log10 q"
-    if s["n_infinite_q"]:
-        xlab += f"   ({s['n_infinite_q']:,} at q=0, pinned right)"
-    finish(ax, xlabel=xlab, ylabel="count")
-    ax.set_title("Significance", loc="left", pad=12)
+    if sizes is not None and float(np.sum(sizes)) > 0:
+        # -- fragment sizes: the nucleosome ladder
+        h = np.asarray(sizes, dtype=np.float64)
+        last = int(np.flatnonzero(h)[-1])          # longest fragment present
+        top = int(min(h.size - 1, 800, max(last + 20, 300)))
+        ax.plot(np.arange(top + 1), h[: top + 1] / h.sum() * 100.0, color=S2, lw=1.4)
+        for x in (147, 294):
+            ax.axvline(x, color=MUTED, lw=1.0, ls=(0, (4, 3)))
+        ax.set_xlim(0, top)
+        ax.set_ylim(bottom=0)
+        ax.grid(axis="x", visible=False)
+        finish(ax, xlabel="fragment length (bp)", ylabel="% of fragments per bp")
+        ax.set_title("Fragment sizes", loc="left", pad=12)
+    else:
+        # -- significance
+        qs = _cap_infinite(np.array([r.neg_log10_q for r in peaks], dtype=np.float64))
+        ax.hist(qs, bins=np.linspace(0, max(float(qs.max()) if qs.size else 1.0, 1.0), 28),
+                color=S2, edgecolor=SURFACE, linewidth=0.7)
+        ax.grid(axis="x", visible=False)
+        # Say so on the axis: the right-edge spike is q underflowing to zero,
+        # not a real mode, and this panel has no room for a footnote.
+        xlab = "-log10 q"
+        if s["n_infinite_q"]:
+            xlab += f"   ({s['n_infinite_q']:,} at q=0, pinned right)"
+        finish(ax, xlabel=xlab, ylabel="count")
+        ax.set_title("Significance", loc="left", pad=12)
+
+    if profile:
+        # -- TSS enrichment profile
+        ax = fig.add_subplot(gs[1, 1])
+        prof = np.asarray(profile, dtype=np.float64)
+        half = (prof.size - 1) // 2
+        x = (np.arange(prof.size) - half) * float(qc.get("bin_size") or 1) / 1000.0
+        ax.plot(x, prof, color=S3, lw=1.4)
+        ax.axhline(1.0, color=MUTED, lw=1.0, ls=(0, (4, 3)))
+        ax.set_xlim(float(x[0]), float(x[-1]))
+        ax.set_ylim(bottom=0)
+        ax.grid(axis="x", visible=False)
+        finish(ax, xlabel="distance to TSS (kb)", ylabel="coverage / flank")
+        ax.set_title("TSS enrichment", loc="left", pad=12)
 
     # -- per chromosome
-    ax = fig.add_subplot(gs[1, 1:])
+    ax = fig.add_subplot(gs[1, 2] if profile else gs[1, 1:])
     chroms = sorted(s["per_chrom"], key=_chrom_key)
     x = np.arange(len(chroms))
     ax.bar(x, [s["per_chrom"][c]["n"] for c in chroms], color=S1, width=0.68)
     ax.set_xticks(x)
-    ax.set_xticklabels(chroms, rotation=90 if len(chroms) > 12 else 0,
-                       fontsize=FS_NOTE if len(chroms) > 24 else FS_TICK)
+    ax.set_xticklabels(chroms, rotation=90 if len(chroms) > (6 if profile else 12) else 0,
+                       fontsize=FS_NOTE if len(chroms) > (12 if profile else 24) else FS_TICK)
     ax.grid(axis="x", visible=False)
     finish(ax, ylabel="regions called")
     ax.set_title("By chromosome", loc="left", pad=12)
@@ -716,6 +771,17 @@ def fig_summary(peaks, s, plt, path, title=None):
     fig.text(0.06, 0.925, f"{sub}{extra}", ha="left", fontsize=FS_SUB,
              color=INK, va="bottom")
     return savefig(fig, path)
+
+
+def qc_figure(peaks: NestedPeakSet, path: str, title: Optional[str] = None,
+              qc: Optional[Dict] = None) -> str:
+    """The one-page QC figure of a run (see ``fig_summary``): written by
+    ``callpeak --figures``.  Returns the path."""
+    if len(peaks) == 0:
+        raise ValueError("no regions in the call set: nothing to plot")
+    plt = apply_style()
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    return fig_summary(peaks, peak_stats(peaks), plt, path, title=title, qc=qc)
 
 
 _FIGURES = (

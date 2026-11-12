@@ -1,6 +1,6 @@
 """Binned coverage: the single in-memory representation everything else uses.
 
-DESIGN.md section 3.1 / 7.1: bin once, never iterate per-base-pair.  Base-pair
+DESIGN.md sections 2 and 10: bin once, never iterate per-base-pair.  Base-pair
 resolution is recovered only inside candidate regions, for summit refinement.
 The cache is what makes the runtime parameter sweep (section 8) affordable --
 the BAM is parsed once and every sweep point is an array operation.
@@ -15,6 +15,21 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import numpy as np
 
 __all__ = ["Coverage"]
+
+
+def _compact(a: np.ndarray) -> np.ndarray:
+    """The smallest unsigned integer array that holds ``a`` exactly, else
+    ``a`` itself.  A fragment pileup is small whole numbers: stored as uint8
+    it is a quarter of the bytes to compress, write and read back, and the
+    values come back identical (the cache is loaded as float32 either way)."""
+    if a.size == 0 or a.dtype.kind in "ui":
+        return a
+    lo, hi = float(a.min()), float(a.max())
+    if lo < 0 or hi > 4_294_967_295 or not np.isfinite(hi):
+        return a
+    dtype = np.uint8 if hi <= 255 else np.uint16 if hi <= 65_535 else np.uint32
+    out = a.astype(dtype)
+    return out if np.array_equal(out, a) else a
 
 
 @dataclass
@@ -98,13 +113,21 @@ class Coverage:
         chroms = [c for c in chroms if c in self.bins]
         if not chroms:
             raise ValueError("no requested chromosomes present in coverage")
+        # The fragment count follows the signal kept, so the signal per
+        # fragment -- what the depth-aware background reads -- is unchanged.
+        n_frag = self.n_fragments
+        if n_frag and len(chroms) < len(self.bins):
+            total = self.total_signal
+            if total > 0:
+                kept = float(sum(float(self.bins[c].sum()) for c in chroms))
+                n_frag = int(round(n_frag * kept / total))
         return Coverage(
             bins={c: self.bins[c] for c in chroms},
             bin_size=self.bin_size,
             chrom_sizes={c: self.chrom_sizes[c] for c in chroms},
             source=self.source,
             is_count=self.is_count,
-            n_fragments=self.n_fragments,
+            n_fragments=n_frag,
             fragment_length=self.fragment_length,
             meta=dict(self.meta),
         )
@@ -139,7 +162,7 @@ class Coverage:
     def thin(self, fraction: float, seed: int = 0) -> "Coverage":
         """Binomial thinning: a depth-subsampled copy of this sample.
 
-        This is what makes the corpus-free tuner possible (DESIGN.md 8.1): every
+        This is what makes the corpus-free tuner possible (DESIGN.md 7): every
         library is deeper than a subsample of itself, so a degraded copy can
         stand in for a shallower experiment without any external reference.
         """
@@ -228,12 +251,50 @@ class Coverage:
         np.savez_compressed(
             str(path),
             __meta__=np.array([str(meta)], dtype=object),
-            **self.bins,
+            **{c: _compact(a) for c, a in self.bins.items()},
         )
 
+    @staticmethod
+    def read_meta(path) -> Dict:
+        """The header of a cache file, without reading any coverage."""
+        z = np.load(str(path), allow_pickle=True)
+        try:
+            return ast.literal_eval(str(z["__meta__"][0]))
+        finally:
+            z.close()
+
     @classmethod
-    def load(cls, path) -> "Coverage":
-        """Read a cache written by :meth:`save`."""
+    def load(cls, path, chroms: Optional[Iterable[str]] = None) -> "Coverage":
+        """Read a cache written by :meth:`save`; ``chroms`` reads only those
+        chromosomes (the fragment count is scaled as in :meth:`subset`)."""
+        if chroms is not None:
+            want = set(chroms)
+            full = cls.read_meta(path)
+            have = full.get("chroms") or []
+            if want != set(have):
+                z = np.load(str(path), allow_pickle=True)
+                try:
+                    keep = [c for c in have if c in want]
+                    if not keep:
+                        raise ValueError("no requested chromosomes present in cache")
+                    bins = {c: np.asarray(z[c], dtype=np.float32) for c in keep}
+                finally:
+                    z.close()
+                n_frag = full.get("n_fragments")
+                share = (full.get("meta") or {}).get("chrom_signal")
+                if n_frag and share:
+                    tot = float(sum(share.values()))
+                    if tot > 0:
+                        n_frag = int(round(n_frag * sum(share[c] for c in keep) / tot))
+                return cls(
+                    bins=bins, bin_size=int(full["bin_size"]),
+                    chrom_sizes={c: full["chrom_sizes"][c] for c in keep},
+                    source=full.get("source", ""),
+                    is_count=bool(full.get("is_count", True)),
+                    n_fragments=n_frag,
+                    fragment_length=full.get("fragment_length"),
+                    meta=dict(full.get("meta") or {}),
+                )
         z = np.load(str(path), allow_pickle=True)
         try:
             meta = ast.literal_eval(str(z["__meta__"][0]))

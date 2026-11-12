@@ -186,7 +186,7 @@ def available_methods() -> List[Dict]:
     # Each re-implemented baseline is run in several configurations -- its
     # defaults and mark-appropriate ones -- because comparing a self-tuned
     # method against fixed-parameter comparators is the strawman that
-    # DESIGN.md 10.2 forbids.  Window size is the user's choice in both.
+    # the fairness protocol (DESIGN.md §11) forbids.  Window size is the user's choice in both.
     reg += [
         dict(key="sicer_like_w200", label="SICER/epic2-style, defaults",
              kind="sicer_like", family="baseline", kw=dict(window=200, gap_windows=3)),
