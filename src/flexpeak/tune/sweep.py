@@ -1,6 +1,6 @@
 """Runtime self-tuning: parameter sweep on a stratified chromosome subset.
 
-DESIGN.md section 8.  There is no pretrained model and no training corpus.  The
+DESIGN.md section 7.  There is no pretrained model and no training corpus.  The
 tuner learns from the sample in front of it:
 
   1. build coverage once on a stratified chromosome subset, cached
@@ -38,24 +38,163 @@ from ..signal.coverage import Coverage
 from .objective import (HeldOut, ObjectiveScore, TuningObjective, heldout_gain,
                         select_plateau)
 
-__all__ = ["TuneResult", "tune", "default_grid", "pick_tuning_chroms"]
+__all__ = ["TuneResult", "tune", "default_grid", "pick_tuning_chroms", "tuning_windows",
+           "window_coverage", "replicate_halves"]
 
 
-def pick_tuning_chroms(cov: Coverage, n: int = 3) -> List[str]:
-    """Stratified chromosome subset (DESIGN.md 7.5).
+def pick_tuning_chroms(cov: Coverage, n: int = 3, skip_largest: bool = False) -> List[str]:
+    """Stratified chromosome subset (DESIGN.md 7).
 
     One large gene-dense, one mid/gene-poor, one small.  A single chromosome is
     not representative for broad marks, and chr1 alone biases toward gene-dense
     regions.
+
+    ``skip_largest`` (the ``--quick`` default, with ``n=2``) takes the
+    median-sized and the smallest primary chromosome instead: together about
+    the size of the largest one, so a sweep costs what a chr1 sweep did, but
+    two chromosomes of different character are seen -- and the largest
+    chromosome, where people tend to look first, stays out of the tuning.
     """
+    from ..scan import _is_primary
+
     chroms = [c for c in cov.chroms if cov.bins[c].size > 10]
-    if len(chroms) <= n:
-        return chroms
-    ordered = sorted(chroms, key=lambda c: cov.chrom_sizes.get(c, 0), reverse=True)
+    prim = [c for c in chroms if _is_primary(c) and c not in ("chrX", "X")] or chroms
+    if len(prim) <= n:
+        return prim
+    ordered = sorted(prim, key=lambda c: cov.chrom_sizes.get(c, 0), reverse=True)
+    if skip_largest:
+        picks = [ordered[len(ordered) // 2], ordered[-1], ordered[len(ordered) // 4]]
+        return list(dict.fromkeys(picks))[:n]
     if n == 1:
         return [ordered[0]]
     picks = [ordered[0], ordered[len(ordered) // 2], ordered[-1]]
     return list(dict.fromkeys(picks))[:n]
+
+
+def window_coverage(cov: Coverage, plan: Sequence[Tuple[str, int, int]]) -> Coverage:
+    """A Coverage of ``(chrom, start, end)`` windows, each a pseudo-chromosome
+    named ``chrom:start-end``.  Lets the sweep run on stratified pieces of
+    several chromosomes for the cost of one (``tune(windows=...)``)."""
+    bs = cov.bin_size
+    bins, sizes = {}, {}
+    for c, s, e in plan:
+        if c not in cov.bins:
+            continue
+        k = f"{c}:{s}-{e}"
+        bins[k] = cov.bins[c][s // bs: e // bs]
+        sizes[k] = int(bins[k].size * bs)
+    return Coverage(bins=bins, bin_size=bs, chrom_sizes=sizes, source=cov.source,
+                    is_count=cov.is_count, n_fragments=None,
+                    fragment_length=cov.fragment_length, meta=dict(cov.meta))
+
+
+def tuning_windows(cov: Coverage, total_bp: int = 100_000_000,
+                   n: int = 4) -> List[Tuple[str, int, int]]:
+    """Stratified tuning windows: ``n`` primary autosomes spread over the
+    size ranking, ``total_bp / n`` from each (``scan.plan_scan_windows``).
+    Measured on pooled H3K9me3 (six chromosomes, same node): tuning on
+    chr10 + chr15 whole took the sweep from 141 s (chr1, 4 points) to 266 s
+    (6 points with replicate halves); 4 x 25 Mb is half of chr1."""
+    from ..scan import _is_primary, plan_scan_windows
+
+    sizes = {c: cov.chrom_sizes.get(c, a.size * cov.bin_size) for c, a in cov.bins.items()
+             if _is_primary(c) and c not in ("chrX", "X")}
+    return plan_scan_windows(sizes or dict(cov.chrom_sizes), total_bp, n)
+
+
+class ReplicateSupport:
+    """Share of calls the replicates support: a region counts when its mean
+    is >= ``min_fold`` x the replicate's own level (median of the 5 kb-
+    smoothed track of that chromosome) in at least ``min_share`` of the
+    replicates.  Prefix sums, so scoring a call set is O(regions).
+
+    This is the reproducibility term when replicates are given.  The held-
+    out likelihood saturates on domain marks -- every setting explains ~99%
+    of the best gain (GSE285245 H3K27me3: spread 0.005 over the grid) -- and
+    then picks noise: its best point had 0.91 of its calls supported by the
+    replicates on held-out chromosomes, against 0.99 for a setting it scored
+    0.01 lower.
+    """
+
+    def __init__(self, replicates: Sequence[Coverage], min_fold: float = 1.5,
+                 min_share: float = 0.75):
+        from scipy.ndimage import uniform_filter1d
+
+        self.min_fold, self.n = float(min_fold), len(replicates)
+        self.need = int(np.ceil(min_share * self.n))
+        self.bin_size = replicates[0].bin_size
+        self.pref, self.level = {}, {}
+        for r in replicates:
+            k = max(1, int(5_000 // r.bin_size))
+            for c, a in r.bins.items():
+                a = a.astype(np.float64)
+                self.pref.setdefault(c, []).append(np.concatenate([[0.0], np.cumsum(a)]))
+                sm = uniform_filter1d(a, k, mode="nearest") if a.size > k else a
+                self.level.setdefault(c, []).append(max(float(np.median(sm)), 1e-6))
+
+    def __call__(self, calls: NestedPeakSet) -> float:
+        bs = self.bin_size
+        ok, tot = 0, 0
+        by: Dict[str, List[Tuple[int, int]]] = {}
+        for r in calls.regions:
+            if r.chrom in self.pref:
+                by.setdefault(r.chrom, []).append((r.start // bs, max(r.start // bs + 1, -(-r.end // bs))))
+        for c, ivs in by.items():
+            iv = np.array(ivs, dtype=np.int64)
+            votes = np.zeros(len(iv), dtype=np.int64)
+            for pc, lv in zip(self.pref[c], self.level[c]):
+                b1 = np.minimum(iv[:, 1], pc.size - 1)
+                b0 = np.minimum(iv[:, 0], b1)
+                m = (pc[b1] - pc[b0]) / np.maximum(b1 - b0, 1)
+                votes += m >= self.min_fold * lv
+            ok += int((votes >= self.need).sum())
+            tot += len(iv)
+        return ok / tot if tot else 0.0
+
+
+def replicate_halves(replicates: Sequence[Coverage], chroms: Sequence[str],
+                     bin_size: int, total: float) -> Tuple[Coverage, Coverage, str]:
+    """Two halves made of whole replicates (1, 3, ... | 2, 4, ...), each
+    rescaled to half of ``total``.
+
+    The read split assumes the counts are reads.  For a bigWig they are
+    pseudo-counts, and a binomial split of them invents a sampling noise the
+    data never had while missing the replicate-to-replicate variation it
+    does have -- so the two halves agree almost perfectly at every setting
+    and the held-out score cannot tell settings apart (GSE285245 H3K27me3:
+    objective spread 0.005 over the grid).  Replicate groups are real
+    independent measurements, and calls on one group are tested against
+    the other group's signal.
+    """
+    def total_of(c):
+        return sum(float(a.sum()) for a in c.bins.values())
+
+    reps = []
+    for r in replicates:
+        r = r.subset([c for c in chroms if c in r.bins])
+        if r.bin_size < bin_size:
+            r = r.rebin(bin_size)
+        reps.append(r)
+    groups = [reps[0::2], reps[1::2]]
+    halves = []
+    for g in groups:
+        bins = {}
+        for c in chroms:
+            arrs = [r.bins[c] for r in g if c in r.bins]
+            if not arrs:
+                continue
+            m = min(a.size for a in arrs)
+            bins[c] = np.sum([a[:m].astype(np.float64) for a in arrs], axis=0)
+        h = Coverage(bins=bins, bin_size=bin_size,
+                     chrom_sizes={c: g[0].chrom_sizes.get(c, bins[c].size * bin_size)
+                                  for c in bins},
+                     source="+".join(r.source for r in g), is_count=g[0].is_count)
+        t = total_of(h)
+        scale = 0.5 * total / t if t > 0 else 1.0
+        h.bins = {c: (a * scale).astype(np.float32) for c, a in h.bins.items()}
+        halves.append(h)
+    ids = lambda k: ",".join(str(i + 1) for i in range(k, len(reps), 2))  # noqa: E731
+    return halves[0], halves[1], f"replicates {ids(0)} | {ids(1)}"
 
 
 def default_grid(broad_hint: bool = False) -> Dict[str, Sequence]:
@@ -173,17 +312,46 @@ def tune(
     tolerance: float = 0.02,
     max_points: Optional[int] = None,
     verbose: bool = False,
+    search: str = "auto",
+    replicate_split: bool = True,
+    skip_largest: bool = False,
+    windows: Optional[Sequence[Tuple[str, int, int]]] = None,
 ) -> TuneResult:
     """Sweep parameters on a chromosome subset and return the plateau setting.
 
     ``seeds`` gives one random read split per seed; more splits average out the
     split's own noise at a cost of two calls per split per grid point.
+
+    With two or more ``replicates`` and ``replicate_split`` the halves are
+    replicate groups instead of read splits (see ``replicate_halves``); the
+    stability term is then agreement between independent replicates.
+
+    ``search``: ``"grid"`` evaluates every combination; ``"coordinate"`` sweeps
+    one axis at a time with the others held at their current best (two
+    passes), which costs the sum of the axis lengths rather than their
+    product and is what lets the grid include the structural settings --
+    gap merging, the focal floor, the weak-domain pass -- at the price of
+    the old 4-point grid.  ``"auto"``: grid up to 8 points, else coordinate.
     """
     base = base or CallParams()
     objective = objective or TuningObjective()
     grid = grid or default_grid(broad_hint=base.bin_size >= 100)
+    # The sweep scores regions; sub-peaks are called once, on the final call.
+    # Scale-space detection inside every region at every grid point on both
+    # halves was most of the sweep's cost on punctate marks (tens of
+    # thousands of regions per chromosome), and the grid does not vary
+    # anything a sub-peak depends on.
+    final_subpeaks = base.call_subpeaks
+    base = base.replace(call_subpeaks=False)
 
-    chroms = list(chroms) if chroms else pick_tuning_chroms(treatment, n_chroms)
+    if windows:
+        # Stratified windows as pseudo-chromosomes (see tuning_windows).
+        treatment = window_coverage(treatment, windows)
+        control = window_coverage(control, windows) if control is not None else None
+        replicates = [window_coverage(r, windows) for r in (replicates or [])]
+        chroms = list(treatment.bins)
+    chroms = list(chroms) if chroms else pick_tuning_chroms(treatment, n_chroms,
+                                                            skip_largest=skip_largest)
     sub = treatment.subset(chroms)
     sub_ctrl = control.subset([c for c in chroms if c in control.bins]) if control else None
     genome_size = sum(sub.chrom_sizes.values())
@@ -200,26 +368,35 @@ def tune(
     ]
 
     reuse_bg = not (set(grid) & BACKGROUND_FIELDS)
+    notes: List[str] = []
     splits = []
-    for s in seeds:
-        a, b = sub.split(seed=s)
-        splits.append((_Half(a, sub_ctrl, base, reuse_bg),
-                       _Half(b, sub_ctrl, base, reuse_bg)))
+    split_desc = "read halves"
+    use_reps = bool(replicate_split and len(rep_subsets) >= 2)
+    support = ReplicateSupport(rep_subsets) if len(rep_subsets) >= 2 else None
+    if use_reps:
+        total = sum(float(a.sum()) for a in sub.bins.values())
+        a, b, split_desc = replicate_halves(rep_subsets, list(sub.bins), base.bin_size, total)
+        splits.append((_Half(a, sub_ctrl, base, reuse_bg), _Half(b, sub_ctrl, base, reuse_bg)))
+        rep_subsets = []  # agreement between the groups is the stability term
+        notes.append("reproducibility = share of calls >= 1.5x in >= 3/4 of the replicates")
+    else:
+        for s in seeds:
+            a, b = sub.split(seed=s)
+            splits.append((_Half(a, sub_ctrl, base, reuse_bg),
+                           _Half(b, sub_ctrl, base, reuse_bg)))
     full_seg: Dict = {}
 
-    keys = sorted(grid)
-    combos = list(itertools.product(*(grid[k] for k in keys)))
-    notes: List[str] = []
-    if max_points and len(combos) > max_points:
-        step = len(combos) / float(max_points)
-        n_all = len(combos)
-        combos = [combos[int(i * step)] for i in range(max_points)]
-        notes.append(f"grid reduced from {n_all} to {len(combos)} points by "
-                     f"max_points={max_points}")
-
+    keys = list(grid)
+    n_product = int(np.prod([len(grid[k]) for k in keys])) if keys else 1
+    if search == "auto":
+        search = "grid" if n_product <= 8 else "coordinate"
+    scored: Dict[Tuple, ObjectiveScore] = {}
     curve: List[Tuple[Dict, ObjectiveScore]] = []
-    for combo in combos:
-        point = dict(zip(keys, combo))
+
+    def evaluate(point: Dict) -> Optional[ObjectiveScore]:
+        key = tuple(point[k] for k in keys)
+        if key in scored:
+            return scored[key]
         p = base.replace(**point)
         try:
             gains, jacc, first = [], [], None
@@ -231,7 +408,9 @@ def tune(
                 jacc.append(interval_jaccard(ca.intervals(), cb.intervals()))
                 first = first or ca
             repro = None
-            if rep_subsets:
+            if support is not None:
+                repro = float(np.mean([support(ca), support(cb)]))
+            elif rep_subsets:
                 full = call_peaks(sub, sub_ctrl, p, segmentation_cache=full_seg)
                 ri = full.intervals()
                 repro = float(np.mean([
@@ -240,17 +419,68 @@ def tune(
                 ]))
         except Exception as exc:  # a bad grid point must not kill the sweep
             notes.append(f"grid point {point} failed: {type(exc).__name__}: {exc}")
-            continue
+            scored[key] = None
+            return None
         sc = objective.score(first, genome_size=genome_size,
                              heldout_gain=float(np.mean(gains)),
                              stability=float(np.mean(jacc)),
                              reproducibility=repro)
-        curve.append((point, sc))
+        scored[key] = sc
+        curve.append((dict(point), sc))
+        return sc
+
+    if search == "grid":
+        combos = list(itertools.product(*(grid[k] for k in keys)))
+        if max_points and len(combos) > max_points:
+            step = len(combos) / float(max_points)
+            n_all = len(combos)
+            combos = [combos[int(i * step)] for i in range(max_points)]
+            notes.append(f"grid reduced from {n_all} to {len(combos)} points by "
+                         f"max_points={max_points}")
+        for combo in combos:
+            evaluate(dict(zip(keys, combo)))
+    elif search == "coordinate":
+        bd = base.to_dict()
+        cur = {}
+        for k in keys:
+            vals = list(grid[k])
+            bv = bd.get(k)
+            if isinstance(bv, list):
+                bv = tuple(bv)
+            cur[k] = bv if bv in vals else vals[len(vals) // 2]
+        for _pass in range(2):
+            changed = False
+            for k in keys:
+                pts = [dict(cur, **{k: v}) for v in grid[k]]
+                scs = [evaluate(pt) for pt in pts]
+                objective.rank([sc for sc in scored.values() if sc is not None])
+                ok = [(pt, sc) for pt, sc in zip(pts, scs) if sc is not None]
+                if not ok:
+                    continue
+                # Best value on this axis; the current one is kept on a
+                # near-tie (1e-3) so the search does not wander on noise.
+                # Not select_plateau: with two values its tolerance holds
+                # both, and the median position is always the second
+                # (measured: focal floor 1.0 at 0.929 chosen over 0.5 at 0.953).
+                tot = [sc.total for _, sc in ok]
+                j = int(np.argmax(tot))
+                here = [i for i, (pt, _) in enumerate(ok) if pt[k] == cur[k]]
+                if here and tot[here[0]] >= tot[j] - 1e-3:
+                    j = here[0]
+                if ok[j][0][k] != cur[k]:
+                    cur[k] = ok[j][0][k]
+                    changed = True
+            if not changed:
+                break
+        notes.append(f"coordinate search: {len(curve)} of {n_product} grid points evaluated")
+    else:
+        raise ValueError(f"search must be 'grid', 'coordinate' or 'auto', got {search!r}")
+    notes.insert(0, f"halves: {split_desc}")
 
     if not curve:
         notes.append("every grid point failed; falling back to base parameters")
-        return TuneResult(base, ObjectiveScore(0, 0, 0, 0, 0, 0, 0, 0.0),
-                          [], chroms, False, notes)
+        return TuneResult(base.replace(call_subpeaks=final_subpeaks),
+                          ObjectiveScore(0, 0, 0, 0, 0, 0, 0, 0.0), [], chroms, False, notes)
 
     objective.rank([s for _, s in curve])
     if verbose:
@@ -262,14 +492,21 @@ def tune(
             "the tuning chromosomes show no reproducible enrichment, so the "
             "selection rests on stability only")
 
-    idx = select_plateau([s.total for _, s in curve], tolerance=tolerance)
-    best_point, best_score = curve[idx]
+    if search == "coordinate":
+        # The best point evaluated, not necessarily where the walk stopped:
+        # held-out gains are re-normalised to the grid's best as points are
+        # added, so an axis decided early can be beaten by a point seen later.
+        best_point, best_score = max(curve, key=lambda x: x[1].total)
+        best_point = dict(best_point)
+    else:
+        idx = select_plateau([s.total for _, s in curve], tolerance=tolerance)
+        best_point, best_score = curve[idx]
     stable, stability_note = _assess_stability(curve, tolerance)
     if stability_note:
         notes.append(stability_note)
 
     return TuneResult(
-        params=base.replace(**best_point),
+        params=base.replace(call_subpeaks=final_subpeaks, **best_point),
         score=best_score,
         curve=curve,
         chroms=chroms,

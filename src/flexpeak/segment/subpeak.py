@@ -1,6 +1,6 @@
 """Scale-space sub-peak detection.
 
-DESIGN.md section 3.3, layer 2.  Smooth the fine-binned signal at a ladder of
+DESIGN.md section 6.  Smooth the fine-binned signal at a ladder of
 bandwidths, find local maxima at every scale, and link maxima across scales.
 A maximum that persists across many scales is real structure; one that appears
 at a single scale is noise.  This is standard practice in astronomical source

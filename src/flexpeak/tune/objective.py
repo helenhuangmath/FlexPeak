@@ -1,6 +1,6 @@
 """The tuning objective -- making "looks right in IGV" explicit.
 
-DESIGN.md section 3.4.  Expert tuning by browser inspection optimises something
+DESIGN.md section 7.  Expert tuning by browser inspection optimises something
 real but unstated.  Automation requires naming it.  The terms:
 
   held-out fit    how well calls made on one half of the reads predict the
@@ -158,7 +158,7 @@ class TuningObjective:
                 "territory_weight must be > 0: stability and reproducibility are "
                 "maximised by over-merging, so removing the territory penalty makes "
                 "the objective reward exactly the failure mode FlexPeak exists to fix "
-                "(see DESIGN.md 3.4 / 8.3)"
+                "(see DESIGN.md 7)"
             )
 
     def score(
@@ -261,7 +261,7 @@ def _mean_jaccard(ref: NestedPeakSet, others: Sequence[NestedPeakSet]) -> float:
 
 
 def select_plateau(scores: List[float], tolerance: float = 0.02) -> int:
-    """Index of the plateau, not the argmax (DESIGN.md 3.4).
+    """Index of the plateau, not the argmax (DESIGN.md 7).
 
     Every setting within ``tolerance`` of the best is considered equivalent;
     among those we take the median position, which lands in the middle of the

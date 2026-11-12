@@ -331,3 +331,275 @@ def run_poisson_ablation(treat, control, params: Optional[CallParams] = None) ->
         "command": "flexpeak.call_peaks(background_model='poisson')",
         "note": "ablation: FlexPeak with a Poisson background",
     }
+
+
+# -- helpers for the external tools ----------------------------------------
+
+def _run(cmd, cwd=None, env=None) -> Tuple[float, "subprocess.CompletedProcess"]:
+    t0 = time.perf_counter()
+    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, env=env)
+    return time.perf_counter() - t0, proc
+
+
+def _fail(cmd, runtime, proc, note="FAILED") -> Dict:
+    tail = (proc.stderr or proc.stdout or "").strip()[-400:]
+    return {"intervals": [], "runtime_s": runtime,
+            "command": " ".join(map(str, cmd)) if isinstance(cmd, (list, tuple)) else str(cmd),
+            "note": f"{note} rc={proc.returncode}: {tail}"}
+
+
+def bam_to_bed(bam: str, bed: str) -> str:
+    """``bedtools bamtobed``, cached beside the BAM."""
+    if not (os.path.exists(bed) and os.path.getsize(bed) > 0):
+        with open(bed, "w") as fh:
+            subprocess.run(["bedtools", "bamtobed", "-i", bam], stdout=fh, check=True)
+    return bed
+
+
+def bam_to_bedgraph(bam: str, bg: str) -> str:
+    """``bedtools genomecov -bg``, cached beside the BAM (SEACR input)."""
+    if not (os.path.exists(bg) and os.path.getsize(bg) > 0):
+        with open(bg, "w") as fh:
+            subprocess.run(["bedtools", "genomecov", "-bg", "-ibam", bam],
+                           stdout=fh, check=True)
+    return bg
+
+
+def chrom_sizes_from_bam(bam: str, path: str) -> str:
+    import pysam
+
+    with pysam.AlignmentFile(bam) as af, open(path, "w") as fh:
+        for n, l in zip(af.references, af.lengths):
+            fh.write(f"{n}\t{l}\n")
+    return path
+
+
+# -- SICER2 (real tool) -----------------------------------------------------
+
+def run_sicer2(treat_bam: str, control_bam: Optional[str], genome_size: int,
+               outdir: str, window: int = 200, gap: int = 600,
+               fragment: int = 50, fdr: float = 0.05, species: str = "mm10",
+               species_size: int = 2_730_871_774, evalue: float = 1000) -> Dict:
+    """SICER2 as a subprocess (``sicer``).
+
+    SICER needs a named species for its chromosome list; the simulated genome
+    uses mm10 chromosome names, so ``-s mm10`` with the effective genome
+    fraction set to the simulated genome's share of mm10 gives it the correct
+    background rate.  Windows and gap are SICER's own parameters: the defaults
+    (200/600) and a broad-mark setting (1000/3000) are both run.
+    """
+    os.makedirs(outdir, exist_ok=True)
+    t_bed = bam_to_bed(treat_bam, treat_bam[:-4] + ".bed")
+    cmd = ["sicer", "-t", t_bed, "-s", species, "-w", str(window), "-g", str(gap),
+           "-f", str(fragment), "-egf", f"{genome_size / species_size:.6f}",
+           "-rt", "1", "-o", outdir, "-cpu", "1"]
+    if control_bam:
+        cmd += ["-c", bam_to_bed(control_bam, control_bam[:-4] + ".bed"),
+                "-fdr", str(fdr)]
+    else:
+        cmd += ["-e", str(evalue)]
+    runtime, proc = _run(cmd)
+    if proc.returncode != 0:
+        return _fail(cmd, runtime, proc)
+    import glob
+
+    base = os.path.basename(t_bed)[:-4]
+    pats = ([f"{base}-W{window}-G{gap}-FDR{fdr}-island.bed",
+             f"{base}-W{window}-G{gap}-FDR{fdr}-island.bed"] if control_bam
+            else [f"{base}-W{window}-G{gap}-E{evalue:g}.scoreisland",
+                  f"{base}-W{window}-G{gap}-E{int(evalue)}.scoreisland"])
+    out = None
+    for pat in pats + [f"{base}-W{window}-G{gap}*island*.bed", f"{base}-W{window}-G{gap}*.scoreisland"]:
+        hits = glob.glob(os.path.join(outdir, pat))
+        if hits:
+            out = hits[0]
+            break
+    if out is None:
+        return {"intervals": [], "runtime_s": runtime, "command": " ".join(cmd),
+                "note": f"no island file found in {outdir}: {os.listdir(outdir)[:6]}"}
+    return {"intervals": read_bed_like(out), "runtime_s": runtime,
+            "command": " ".join(cmd), "note": ""}
+
+
+# -- SEACR (real tool) ------------------------------------------------------
+
+def run_seacr(seacr_sh: str, treat_bam: str, control_bam: Optional[str], outdir: str,
+              mode: str = "stringent", norm: str = "norm",
+              threshold: float = 0.01) -> Dict:
+    """SEACR 1.3 as a subprocess: ``SEACR_1.3.sh exp.bg [ctrl.bg|thr] norm mode out``.
+
+    SEACR is built for CUT&RUN fragment bedgraphs; here the simulated reads are
+    their own fragments (50 bp), so ``bedtools genomecov -bg`` is the exact
+    input it expects.  With a control, SEACR thresholds on the control's own
+    signal distribution; without, ``threshold`` is the fraction of top regions
+    kept -- both of SEACR's documented modes are run.
+    """
+    os.makedirs(outdir, exist_ok=True)
+    t_bg = bam_to_bedgraph(treat_bam, treat_bam[:-4] + ".bedgraph")
+    second = (bam_to_bedgraph(control_bam, control_bam[:-4] + ".bedgraph")
+              if control_bam else str(threshold))
+    prefix = os.path.join(outdir, os.path.basename(treat_bam)[:-4] + f"_{norm}_{mode}")
+    cmd = ["bash", seacr_sh, t_bg, second, norm if control_bam else "non", mode, prefix]
+    runtime, proc = _run(cmd, cwd=outdir)
+    out = f"{prefix}.{mode}.bed"
+    if proc.returncode != 0 or not os.path.exists(out):
+        return _fail(cmd, runtime, proc)
+    return {"intervals": read_bed_like(out), "runtime_s": runtime,
+            "command": " ".join(cmd), "note": ""}
+
+
+# -- differential comparators ------------------------------------------------
+
+def run_flexpeak_diff(reps_a, reps_b, controls=None, bin_size: int = 100,
+                      norm: str = "background", **kw) -> Dict:
+    """FlexPeak differential on in-memory coverage.  Returns signed intervals."""
+    from flexpeak.diff import DiffParams, differential_from_coverage
+
+    t0 = time.perf_counter()
+    params = DiffParams(bin_size=bin_size, norm=norm, **kw)
+    ra = [r.rebin(bin_size) for r in reps_a]
+    rb = [r.rebin(bin_size) for r in reps_b]
+    ctrl = [c.rebin(bin_size) for c in (controls or [])] or None
+    res = differential_from_coverage(ra, rb, ctrl, ctrl, params)
+    return {
+        "gain": res.intervals("gain"), "loss": res.intervals("loss"),
+        "runtime_s": time.perf_counter() - t0,
+        "command": f"flexpeak.diff.differential_from_coverage(params={params.to_dict()})",
+        "note": f"rho={res.diagnostics['rho']:.4f} ({res.diagnostics['rho_source']})",
+    }
+
+
+def run_thor(bams_a: List[str], bams_b: List[str], chrom_sizes: str, outdir: str,
+             name: str = "thor", inputs_a: Optional[List[str]] = None,
+             inputs_b: Optional[List[str]] = None, pvalue: float = 0.05,
+             extra: Sequence[str] = ()) -> Dict:
+    """THOR (rgt-THOR) as a subprocess.
+
+    THOR's narrowPeak output marks each differential peak's direction in the
+    strand column: ``+`` higher in the first condition, ``-`` higher in the
+    second (RGT documentation, "THOR output").  Condition A is given first, so
+    ``+`` maps to ``gain``.
+    """
+    # THOR refuses to run if --output-dir already exists; write the config
+    # beside it and let THOR create it.
+    import shutil as _sh
+
+    if os.path.isdir(outdir):
+        _sh.rmtree(outdir)
+    os.makedirs(os.path.dirname(outdir) or ".", exist_ok=True)
+    cfg = os.path.join(os.path.dirname(outdir) or ".", f"{name}.config")
+    with open(cfg, "w") as fh:
+        fh.write("#rep1\n" + "\n".join(bams_a) + "\n#rep2\n" + "\n".join(bams_b) + "\n")
+        # THOR pairs inputs with replicates one to one; a single input is
+        # repeated for every replicate of the condition.
+        if inputs_a:
+            fh.write("#inputs1\n" + "\n".join((inputs_a * len(bams_a))[: len(bams_a)]) + "\n")
+        if inputs_b:
+            fh.write("#inputs2\n" + "\n".join((inputs_b * len(bams_b))[: len(bams_b)]) + "\n")
+        fh.write(f"#chrom_sizes\n{chrom_sizes}\n")
+    cmd = ["rgt-THOR", cfg, "--output-dir", outdir, "--name", name,
+           "--pvalue", str(pvalue), "--no-correction"] + list(extra)
+    runtime, proc = _run(cmd)
+    out = os.path.join(outdir, f"{name}-diffpeaks.narrowPeak")
+    if proc.returncode != 0 or not os.path.exists(out):
+        r = _fail(cmd, runtime, proc)
+        r.update(gain=[], loss=[])
+        return r
+    gain, loss = [], []
+    with open(out) as fh:
+        for line in fh:
+            f = line.rstrip("\n").split("\t")
+            if len(f) < 6 or line.startswith("#"):
+                continue
+            iv = (f[0], int(f[1]), int(f[2]))
+            (gain if f[5] == "+" else loss).append(iv)
+    return {"gain": gain, "loss": loss, "runtime_s": runtime,
+            "command": " ".join(cmd), "note": ""}
+
+
+def run_macs2_bdgdiff(exe: str, bams_a: List[str], bams_b: List[str], control_bam: str,
+                      genome_size: int, outdir: str, name: str = "bdgdiff",
+                      extsize: int = 50, cutoff: float = 3.0) -> Dict:
+    """MACS2's documented differential workflow: callpeak -B per condition, then
+    ``bdgdiff`` on the pileup/lambda tracks with the two depths."""
+    os.makedirs(outdir, exist_ok=True)
+    cmds, depths = [], []
+    t0 = time.perf_counter()
+    for tag, bams in (("A", bams_a), ("B", bams_b)):
+        cmd = [exe, "callpeak", "-t", *bams, "-c", control_bam, "-g", str(genome_size),
+               "-n", f"{name}_{tag}", "--outdir", outdir, "--nomodel", "--extsize",
+               str(extsize), "-B", "-q", "0.05"]
+        cmds.append(" ".join(cmd))
+        _, proc = _run(cmd)
+        if proc.returncode != 0:
+            r = _fail(cmd, time.perf_counter() - t0, proc)
+            r.update(gain=[], loss=[])
+            return r
+        # Depth after filtering, from the callpeak log ("tags after filtering in treatment").
+        m = [l for l in proc.stderr.splitlines() if "tags after filtering in treatment" in l]
+        depths.append(int(m[0].split(":")[-1].strip()) if m else 1)
+    d1, d2 = depths
+    cmd = [exe, "bdgdiff", "--t1", os.path.join(outdir, f"{name}_A_treat_pileup.bdg"),
+           "--c1", os.path.join(outdir, f"{name}_A_control_lambda.bdg"),
+           "--t2", os.path.join(outdir, f"{name}_B_treat_pileup.bdg"),
+           "--c2", os.path.join(outdir, f"{name}_B_control_lambda.bdg"),
+           "--d1", str(d1), "--d2", str(d2), "-g", "60", "-l", "120", "--cutoff", str(cutoff),
+           "--o-prefix", os.path.join(outdir, name)]
+    cmds.append(" ".join(cmd))
+    _, proc = _run(cmd)
+    runtime = time.perf_counter() - t0
+    c1 = os.path.join(outdir, f"{name}_c3.0_cond1.bed")
+    c2 = os.path.join(outdir, f"{name}_c3.0_cond2.bed")
+    if proc.returncode != 0:
+        r = _fail(cmd, runtime, proc)
+        r.update(gain=[], loss=[])
+        return r
+    import glob
+
+    c1 = (glob.glob(os.path.join(outdir, f"{name}_c*_cond1.bed")) or [c1])[0]
+    c2 = (glob.glob(os.path.join(outdir, f"{name}_c*_cond2.bed")) or [c2])[0]
+    return {"gain": read_bed_like(c1), "loss": read_bed_like(c2), "runtime_s": runtime,
+            "command": " ; ".join(cmds), "note": f"depths {d1}/{d2}"}
+
+
+def run_sicer_df(bams_a: List[str], bams_b: List[str], control_bam: Optional[str],
+                 genome_size: int, outdir: str, window: int = 200, gap: int = 600,
+                 fragment: int = 50, fdr: float = 0.05, species: str = "mm10",
+                 species_size: int = 2_730_871_774) -> Dict:
+    """SICER2's differential mode (``sicer_df``): islands on each condition,
+    then increased/decreased islands between them.  Replicates are pooled
+    because sicer_df takes one file per condition."""
+    os.makedirs(outdir, exist_ok=True)
+
+    def pooled_bed(bams, tag):
+        path = os.path.join(outdir, f"{tag}_pooled.bed")
+        if not os.path.exists(path):
+            with open(path, "w") as fh:
+                for b in bams:
+                    subprocess.run(["bedtools", "bamtobed", "-i", b], stdout=fh, check=True)
+        return path
+
+    a_bed, b_bed = pooled_bed(bams_a, "A"), pooled_bed(bams_b, "B")
+    cmd = ["sicer_df", "-t", a_bed, b_bed, "-s", species, "-w", str(window), "-g", str(gap),
+           "-f", str(fragment), "-egf", f"{genome_size / species_size:.6f}", "-rt", "1",
+           "-fdr_df", str(fdr), "-o", outdir, "-cpu", "1"]
+    if control_bam:
+        c_bed = bam_to_bed(control_bam, control_bam[:-4] + ".bed")
+        cmd += ["-c", c_bed, c_bed, "-fdr", str(fdr)]
+    else:
+        cmd += ["-e", "1000"]
+    runtime, proc = _run(cmd, cwd=outdir)
+    if proc.returncode != 0:
+        r = _fail(cmd, runtime, proc)
+        r.update(gain=[], loss=[])
+        return r
+    import glob
+
+    inc = glob.glob(os.path.join(outdir, "*increased*"))
+    dec = glob.glob(os.path.join(outdir, "*decreased*"))
+    if not inc or not dec:
+        return {"gain": [], "loss": [], "runtime_s": runtime, "command": " ".join(cmd),
+                "note": f"no increased/decreased files: {os.listdir(outdir)[:8]}"}
+    # "increased" is relative to the first file (A): higher in A = gain.
+    return {"gain": read_bed_like(inc[0]), "loss": read_bed_like(dec[0]),
+            "runtime_s": runtime, "command": " ".join(cmd), "note": ""}

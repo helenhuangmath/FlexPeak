@@ -1,7 +1,7 @@
 """Synthetic ChIP-like data with known ground truth.
 
 Used by the test suite and by the worked examples.  It is also the seed of the
-evaluation harness (DESIGN.md section 9): a simulator where truth is known
+evaluation harness (DESIGN.md section 11): a simulator where truth is known
 exactly is the only place where precision and recall are unambiguous, so it is
 the right place to catch regressions before touching real data.
 
@@ -22,7 +22,8 @@ import numpy as np
 
 from .signal.coverage import Coverage
 
-__all__ = ["TruthRegion", "SimulatedDataset", "simulate", "write_bam", "write_bigwig"]
+__all__ = ["TruthRegion", "SimulatedDataset", "simulate", "write_bam", "write_bigwig",
+           "DiffTruth", "SimulatedDifferential", "simulate_differential"]
 
 
 @dataclass
@@ -77,6 +78,7 @@ def simulate(
     subpeaks_per_domain: int = 3,
     depth_factor: float = 1.0,
     seed: int = 0,
+    drift_sd: float = 0.35,
 ) -> SimulatedDataset:
     """Generate a treatment/control pair with known truth.
 
@@ -86,6 +88,10 @@ def simulate(
         default is a realistically overdispersed library.  Raising it is how the
         "low quality data" scenario is simulated.
     depth_factor : multiplies all signal, simulating sequencing depth.
+    drift_sd : relative amplitude of the slow baseline drift shared by
+        treatment and control (0.35 is deliberately harsh: a swell of that
+        size at a 2% chromosome scale is what the local background has to
+        survive).
     """
     rng = np.random.default_rng(seed)
     chrom_sizes = chrom_sizes or {"chr1": 4_000_000, "chr2": 2_000_000}
@@ -104,7 +110,7 @@ def simulate(
         # no-control mode and unfairly penalise control-based background
         # estimation.
         drift = _smooth_noise(nb, rng, scale=max(4, nb // 50))
-        base = 1.0 + 0.35 * drift
+        base = 1.0 + drift_sd * drift
         baseline[chrom] = base
         prof = base.copy()
 
@@ -189,6 +195,159 @@ def simulate(
         truth=sorted(truth, key=lambda r: (r.chrom, r.start)),
         profile=profile,
         params=params,
+    )
+
+
+# -- two conditions with known differential regions -------------------------
+
+
+@dataclass
+class DiffTruth:
+    chrom: str
+    start: int
+    end: int
+    direction: str
+    """'gain' = higher in condition A, 'loss' = higher in condition B."""
+    fold: float
+    kind: str  # "narrow" | "broad"
+
+    @property
+    def width(self) -> int:
+        return self.end - self.start
+
+
+@dataclass
+class SimulatedDifferential:
+    reps_a: List[Coverage]
+    reps_b: List[Coverage]
+    controls: List[Coverage]
+    truth: List[DiffTruth]
+    shared: List[TruthRegion]
+    """Enriched regions present in both conditions at the same level."""
+    params: Dict
+
+    def truth_intervals(self, direction: Optional[str] = None) -> List[Tuple[str, int, int]]:
+        return [(t.chrom, t.start, t.end) for t in self.truth
+                if direction is None or t.direction == direction]
+
+
+def simulate_differential(
+    chrom_sizes: Optional[Dict[str, int]] = None,
+    bin_size: int = 25,
+    background_level: float = 8.0,
+    dispersion: float = 0.15,
+    replicate_cv: float = 0.15,
+    n_reps: int = 2,
+    n_shared_narrow: int = 30,
+    n_shared_broad: int = 4,
+    n_diff_narrow: int = 20,
+    n_diff_broad: int = 4,
+    narrow_width: int = 600,
+    broad_width: int = 40_000,
+    narrow_fold: float = 8.0,
+    broad_fold: float = 2.5,
+    diff_fold: float = 3.0,
+    depth_a: float = 1.0,
+    depth_b: float = 1.0,
+    seed: int = 0,
+) -> SimulatedDifferential:
+    """Two conditions sharing a baseline, with known gains and losses.
+
+    Both conditions carry the same shared peaks and domains.  Differential
+    regions are enriched in *both* conditions but ``diff_fold`` times higher in
+    one of them, half as gains (higher in A) and half as losses (higher in B),
+    half narrow and half broad.  Each replicate draws its own NB counts and a
+    per-region log-normal jitter of ``replicate_cv`` so biological
+    variability exists for the overdispersion estimate to find.  ``depth_a``
+    and ``depth_b`` scale the two libraries, which is what a normalisation
+    method has to undo.
+    """
+    rng = np.random.default_rng(seed)
+    chrom_sizes = chrom_sizes or {"chr1": 4_000_000, "chr2": 2_000_000}
+    base_a: Dict[str, np.ndarray] = {}
+    base_b: Dict[str, np.ndarray] = {}
+    baseline: Dict[str, np.ndarray] = {}
+    truth: List[DiffTruth] = []
+    shared: List[TruthRegion] = []
+    region_masks: List[Tuple[str, int, int]] = []  # for replicate jitter
+
+    for chrom, size in chrom_sizes.items():
+        nb = size // bin_size
+        drift = _smooth_noise(nb, rng, scale=max(4, nb // 50))
+        base = 1.0 + 0.35 * drift
+        baseline[chrom] = base
+        pa, pb = base.copy(), base.copy()
+        placed: List[Tuple[int, int]] = []
+
+        def place(width_bp: int, tries: int = 300) -> Optional[Tuple[int, int]]:
+            w = max(2, width_bp // bin_size)
+            for _ in range(tries):
+                s = int(rng.integers(5, max(6, nb - w - 5)))
+                e = s + w
+                if all(e + 40 < ps or s > pe + 40 for ps, pe in placed):
+                    placed.append((s, e))
+                    return s, e
+            return None
+
+        def add(prof, s, e, kind, fold):
+            if kind == "narrow":
+                c, sg = (s + e) / 2.0, max(1.0, (e - s) / 4.0)
+                prof += (fold - 1.0) * _gauss(nb, c, sg)
+            else:
+                block = np.zeros(nb)
+                block[s:e] = fold - 1.0
+                prof += _smooth(block, max(1, (e - s) // 20))
+
+        for kind, n_sh, n_df, w, f in (("narrow", n_shared_narrow, n_diff_narrow,
+                                          narrow_width, narrow_fold),
+                                         ("broad", n_shared_broad, n_diff_broad,
+                                          broad_width, broad_fold)):
+            for _ in range(n_sh):
+                got = place(w)
+                if not got:
+                    continue
+                s, e = got
+                add(pa, s, e, kind, f)
+                add(pb, s, e, kind, f)
+                shared.append(TruthRegion(chrom, s * bin_size, e * bin_size, kind, f))
+                region_masks.append((chrom, s, e))
+            for i in range(n_df):
+                got = place(w)
+                if not got:
+                    continue
+                s, e = got
+                direction = "gain" if i % 2 == 0 else "loss"
+                hi = 1.0 + (f - 1.0) * diff_fold
+                add(pa if direction == "gain" else pb, s, e, kind, hi)
+                add(pb if direction == "gain" else pa, s, e, kind, f)
+                truth.append(DiffTruth(chrom, s * bin_size, e * bin_size, direction,
+                                       diff_fold, kind))
+                region_masks.append((chrom, s, e))
+        base_a[chrom], base_b[chrom] = pa, pb
+
+    def draw(profile: Dict[str, np.ndarray], depth: float, tag: str) -> Coverage:
+        bins = {}
+        for chrom, prof in profile.items():
+            lam = prof.copy()
+            if replicate_cv > 0:
+                for c, s, e in region_masks:
+                    if c == chrom:
+                        lam[s:e] *= float(np.exp(rng.normal(0.0, replicate_cv)))
+            bins[chrom] = _nb_sample(rng, lam * background_level * depth,
+                                     dispersion).astype(np.float32)
+        return Coverage(bins=bins, bin_size=bin_size, chrom_sizes=dict(chrom_sizes),
+                        source=f"sim:diff:{tag}:seed{seed}", is_count=True)
+
+    reps_a = [draw(base_a, depth_a, f"A{i + 1}") for i in range(n_reps)]
+    reps_b = [draw(base_b, depth_b, f"B{i + 1}") for i in range(n_reps)]
+    controls = [draw(baseline, 1.0, "input")]
+    return SimulatedDifferential(
+        reps_a=reps_a, reps_b=reps_b, controls=controls,
+        truth=sorted(truth, key=lambda t: (t.chrom, t.start)),
+        shared=sorted(shared, key=lambda r: (r.chrom, r.start)),
+        params=dict(bin_size=bin_size, background_level=background_level,
+                    dispersion=dispersion, replicate_cv=replicate_cv, n_reps=n_reps,
+                    diff_fold=diff_fold, depth_a=depth_a, depth_b=depth_b, seed=seed),
     )
 
 

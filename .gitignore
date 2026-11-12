@@ -1,8 +1,18 @@
 __pycache__/
 *.pyc
+*.egg-info/
 .pytest_cache/
 .ruff_cache/
+.DS_Store
+build/
 examples/tutorial_out/
-testing/data/
-testing/results/
-testing/cache/
+examples/geo_out/
+.flexpeak_cache/
+
+# Benchmark inputs and raw outputs live outside the repository (symlinked here)
+Benchmark/data
+Benchmark/data_diff
+Benchmark/results/macs_raw
+Benchmark/results/calls
+Benchmark/results_diff/raw
+Benchmark/results_diff/calls

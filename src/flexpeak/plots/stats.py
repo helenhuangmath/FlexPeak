@@ -17,7 +17,7 @@ later.  All output is set in Arial with black text (vector PDF by default) (see 
 from __future__ import annotations
 
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -27,7 +27,7 @@ from .style import (
     MUTED, S1, S2, S3, SURFACE, TITLE_PAD, apply_style, finish, footnote, savefig,
 )
 
-__all__ = ["peak_stats", "peak_stat_figures", "format_stats"]
+__all__ = ["peak_stats", "peak_stat_figures", "format_stats", "qc_figure"]
 
 
 # -- numbers ----------------------------------------------------------------
@@ -80,17 +80,46 @@ def _log_bins(vals: np.ndarray, n: int = 34):
 def _quantiles(vals) -> Dict[str, float]:
     v = _finite(np.asarray(vals, dtype=np.float64))
     if v.size == 0:
-        return {"n": 0, "min": 0.0, "q25": 0.0, "median": 0.0, "q75": 0.0,
-                "mean": 0.0, "max": 0.0}
+        return {"n": 0, "min": 0.0, "q05": 0.0, "q25": 0.0, "median": 0.0, "q75": 0.0,
+                "q95": 0.0, "mean": 0.0, "max": 0.0}
     return {
         "n": int(v.size),
         "min": float(v.min()),
+        "q05": float(np.percentile(v, 5)),
         "q25": float(np.percentile(v, 25)),
         "median": float(np.median(v)),
         "q75": float(np.percentile(v, 75)),
+        "q95": float(np.percentile(v, 95)),
         "mean": float(v.mean()),
         "max": float(v.max()),
     }
+
+
+WIDTH_EDGES = (0, 200, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000,
+               500_000)
+"""Width classes (bp) of the summary histogram; the last class is open."""
+
+
+def _fmt_bp(v: float) -> str:
+    v = float(v)
+    if v >= 1_000_000:
+        return f"{v / 1e6:g} Mb"
+    if v >= 1_000:
+        return f"{v / 1e3:g} kb"
+    return f"{v:g} bp"
+
+
+def width_histogram(widths, edges: Sequence[int] = WIDTH_EDGES) -> List[Dict]:
+    """Counts and territory per width class: ``[{lo, hi, label, n, bp}, ...]``."""
+    w = np.asarray(widths, dtype=np.float64)
+    out = []
+    for i, lo in enumerate(edges):
+        hi = edges[i + 1] if i + 1 < len(edges) else None
+        sel = (w >= lo) & (w < hi) if hi is not None else (w >= lo)
+        label = (f"{_fmt_bp(lo)}-{_fmt_bp(hi)}" if hi is not None else f">= {_fmt_bp(lo)}")
+        out.append({"lo": int(lo), "hi": int(hi) if hi is not None else None, "label": label,
+                    "n": int(sel.sum()), "bp": int(w[sel].sum())})
+    return out
 
 
 def peak_stats(peaks: NestedPeakSet) -> Dict:
@@ -138,12 +167,27 @@ def peak_stats(peaks: NestedPeakSet) -> Dict:
         "n_infinite_q": int((~np.isfinite(qs)).sum()),
         "subpeaks_per_region": _quantiles(n_sub_per),
         "per_chrom": per_chrom,
+        "by_kind_source": _by_kind_source(regions),
+        "width_by_kind": {
+            k: _quantiles([r.width for r in regions if r.kind == k]) for k in ("domain", "peak")
+        },
+        "width_histogram": width_histogram(widths),
+        "subpeak_width_histogram": width_histogram(sub_widths),
+        "focal_scales": list((((peaks.params or {}).get("call") or {}).get("focal_scales")) or []),
         "domain_min_width": _call_param(peaks, "domain_min_width", 2000),
         "min_fold": _call_param(peaks, "min_fold", 0.0),
         "qvalue": _call_param(peaks, "qvalue", 0.05),
         "treatment": (peaks.params or {}).get("treatment"),
         "approximate_pvalues": bool((peaks.params or {}).get("approximate_pvalues")),
     }
+
+
+def _by_kind_source(regions) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for r in regions:
+        k = f"{r.kind}/{getattr(r, 'source', 'hmm')}"
+        out[k] = out.get(k, 0) + 1
+    return dict(sorted(out.items()))
 
 
 _SUMMARY_ROWS = (
@@ -172,6 +216,46 @@ def format_stats(s: Dict) -> str:
     if s["subpeak_width"]["n"]:
         lines.append(f"  {'median sub-peak width':<26} "
                      f"{s['subpeak_width']['median']:,.0f} bp")
+    if s.get("by_kind_source"):
+        lines.append("")
+        lines.append("  regions by kind / origin (hmm = domain segmentation, focal = "
+                     "sliding-window pass)")
+        for k, v in s["by_kind_source"].items():
+            lines.append(f"    {k:<24} {v:>10,}")
+    if s.get("focal_scales"):
+        lines.append(f"  {'focal windows':<26} "
+                     + ", ".join(f"{w:,}" for w in s["focal_scales"]) + " bp")
+
+    def _qrow(label, q):
+        return (f"  {label:<14} n={q['n']:>9,}  p5 {q['q05']:>9,.0f}  p25 {q['q25']:>9,.0f}  "
+                f"median {q['median']:>9,.0f}  p75 {q['q75']:>9,.0f}  p95 {q['q95']:>10,.0f}  "
+                f"max {q['max']:>11,.0f}")
+
+    lines += ["", "  width distribution (bp)"]
+    lines.append(_qrow("all regions", s["width"]))
+    for k in ("domain", "peak"):
+        q = s.get("width_by_kind", {}).get(k)
+        if q and q["n"]:
+            lines.append(_qrow(k + "s", q))
+    if s["subpeak_width"]["n"]:
+        lines.append(_qrow("sub-peaks", s["subpeak_width"]))
+
+    def _hist(title, hist, total_n):
+        lines.append("")
+        lines.append(f"  {title}")
+        lines.append(f"    {'width':<18} {'n':>10} {'%':>7} {'territory':>12}")
+        peak = max((h["n"] for h in hist), default=0) or 1
+        last = max((i for i, h in enumerate(hist) if h["n"]), default=-1)
+        for h in hist[: last + 1]:
+            pct = 100.0 * h["n"] / total_n if total_n else 0.0
+            bar = "#" * int(round(30 * h["n"] / peak))
+            lines.append(f"    {h['label']:<18} {h['n']:>10,} {pct:>6.1f}% "
+                         f"{h['bp'] / 1e6:>9,.2f} Mb  {bar}")
+
+    if s.get("width_histogram"):
+        _hist("region width histogram", s["width_histogram"], s["n_regions"])
+    if s.get("subpeak_width_histogram") and s["n_subpeaks"]:
+        _hist("sub-peak width histogram", s["subpeak_width_histogram"], s["n_subpeaks"])
     if s["approximate_pvalues"]:
         lines.append("")
         lines.append("  NOTE: input was not raw counts; p/q-values are approximate.")
@@ -555,8 +639,32 @@ def fig_subpeaks_per_region(peaks, s, plt, path):
     return savefig(fig, path)
 
 
-def fig_summary(peaks, s, plt, path, title=None):
-    """One page: the numbers plus the four distributions that matter most."""
+def _qc_rows(qc: Dict) -> List:
+    """Library-QC lines for the numbers panel, from ``qc_metrics`` output."""
+    rows = []
+    if qc.get("n_fragments"):
+        rows.append(("fragments", f"{qc['n_fragments'] / 1e6:,.1f} M"))
+    if qc.get("frip") is not None:
+        rows.append(("FRiP", f"{qc['frip']:.3f}"))
+    if qc.get("tss_enrichment") is not None:
+        rows.append(("TSS enrichment", f"{qc['tss_enrichment']:.1f}"))
+    if qc.get("nucleosome_free_fraction") is not None:
+        rows.append(("nucleosome-free fragments", f"{qc['nucleosome_free_fraction']:.0%}"))
+    if qc.get("grade"):
+        rows.append(("quality grade", str(qc["grade"])))
+    return rows
+
+
+def fig_summary(peaks, s, plt, path, title=None, qc=None):
+    """One page: the numbers plus the distributions that matter most.
+
+    With ``qc`` (the ``qc_metrics`` dictionary, plus ``fragment_sizes`` when
+    the library is paired-end) the page is the run's single QC figure: the
+    library numbers join the summary, the fragment-size ladder takes the
+    place of the significance histogram and the TSS profile sits beside the
+    per-chromosome counts.
+    """
+    qc = qc or {}
     fig = plt.figure(figsize=(15.0, 9.0))
     gs = fig.add_gridspec(2, 3, hspace=0.52, wspace=0.28,
                           left=0.06, right=0.975, top=0.855, bottom=0.09)
@@ -564,13 +672,14 @@ def fig_summary(peaks, s, plt, path, title=None):
     # -- numbers panel
     ax = fig.add_subplot(gs[0, 0])
     ax.axis("off")
-    y = 1.0
-    for label, fn in _SUMMARY_ROWS:
+    rows = [(label, fn(s)) for label, fn in _SUMMARY_ROWS] + _qc_rows(qc)
+    y, dy = 1.0, min(0.083, 1.0 / max(len(rows), 1))
+    for label, value in rows:
         ax.text(0.0, y, label, fontsize=FS_NOTE, color=INK, va="top",
                 transform=ax.transAxes)
-        ax.text(1.0, y, fn(s), fontsize=FS_NOTE, color=INK, va="top", ha="right",
+        ax.text(1.0, y, value, fontsize=FS_NOTE, color=INK, va="top", ha="right",
                 transform=ax.transAxes)
-        y -= 0.083
+        y -= dy
     ax.set_title("Summary", loc="left", pad=12)
 
     # -- width
@@ -596,28 +705,58 @@ def fig_summary(peaks, s, plt, path, title=None):
     finish(ax, xlabel="fold enrichment", ylabel="count")
     ax.set_title("Enrichment", loc="left", pad=12)
 
-    # -- significance
+    sizes = qc.get("fragment_sizes")
+    profile = qc.get("tss_profile")
     ax = fig.add_subplot(gs[1, 0])
-    qs = _cap_infinite(np.array([r.neg_log10_q for r in peaks], dtype=np.float64))
-    ax.hist(qs, bins=np.linspace(0, max(float(qs.max()) if qs.size else 1.0, 1.0), 28),
-            color=S2, edgecolor=SURFACE, linewidth=0.7)
-    ax.grid(axis="x", visible=False)
-    # Say so on the axis: the right-edge spike is q underflowing to zero, not a
-    # real mode, and this panel has no room for a footnote.
-    xlab = "-log10 q"
-    if s["n_infinite_q"]:
-        xlab += f"   ({s['n_infinite_q']:,} at q=0, pinned right)"
-    finish(ax, xlabel=xlab, ylabel="count")
-    ax.set_title("Significance", loc="left", pad=12)
+    if sizes is not None and float(np.sum(sizes)) > 0:
+        # -- fragment sizes: the nucleosome ladder
+        h = np.asarray(sizes, dtype=np.float64)
+        last = int(np.flatnonzero(h)[-1])          # longest fragment present
+        top = int(min(h.size - 1, 800, max(last + 20, 300)))
+        ax.plot(np.arange(top + 1), h[: top + 1] / h.sum() * 100.0, color=S2, lw=1.4)
+        for x in (147, 294):
+            ax.axvline(x, color=MUTED, lw=1.0, ls=(0, (4, 3)))
+        ax.set_xlim(0, top)
+        ax.set_ylim(bottom=0)
+        ax.grid(axis="x", visible=False)
+        finish(ax, xlabel="fragment length (bp)", ylabel="% of fragments per bp")
+        ax.set_title("Fragment sizes", loc="left", pad=12)
+    else:
+        # -- significance
+        qs = _cap_infinite(np.array([r.neg_log10_q for r in peaks], dtype=np.float64))
+        ax.hist(qs, bins=np.linspace(0, max(float(qs.max()) if qs.size else 1.0, 1.0), 28),
+                color=S2, edgecolor=SURFACE, linewidth=0.7)
+        ax.grid(axis="x", visible=False)
+        # Say so on the axis: the right-edge spike is q underflowing to zero,
+        # not a real mode, and this panel has no room for a footnote.
+        xlab = "-log10 q"
+        if s["n_infinite_q"]:
+            xlab += f"   ({s['n_infinite_q']:,} at q=0, pinned right)"
+        finish(ax, xlabel=xlab, ylabel="count")
+        ax.set_title("Significance", loc="left", pad=12)
+
+    if profile:
+        # -- TSS enrichment profile
+        ax = fig.add_subplot(gs[1, 1])
+        prof = np.asarray(profile, dtype=np.float64)
+        half = (prof.size - 1) // 2
+        x = (np.arange(prof.size) - half) * float(qc.get("bin_size") or 1) / 1000.0
+        ax.plot(x, prof, color=S3, lw=1.4)
+        ax.axhline(1.0, color=MUTED, lw=1.0, ls=(0, (4, 3)))
+        ax.set_xlim(float(x[0]), float(x[-1]))
+        ax.set_ylim(bottom=0)
+        ax.grid(axis="x", visible=False)
+        finish(ax, xlabel="distance to TSS (kb)", ylabel="coverage / flank")
+        ax.set_title("TSS enrichment", loc="left", pad=12)
 
     # -- per chromosome
-    ax = fig.add_subplot(gs[1, 1:])
+    ax = fig.add_subplot(gs[1, 2] if profile else gs[1, 1:])
     chroms = sorted(s["per_chrom"], key=_chrom_key)
     x = np.arange(len(chroms))
     ax.bar(x, [s["per_chrom"][c]["n"] for c in chroms], color=S1, width=0.68)
     ax.set_xticks(x)
-    ax.set_xticklabels(chroms, rotation=90 if len(chroms) > 12 else 0,
-                       fontsize=FS_NOTE if len(chroms) > 24 else FS_TICK)
+    ax.set_xticklabels(chroms, rotation=90 if len(chroms) > (6 if profile else 12) else 0,
+                       fontsize=FS_NOTE if len(chroms) > (12 if profile else 24) else FS_TICK)
     ax.grid(axis="x", visible=False)
     finish(ax, ylabel="regions called")
     ax.set_title("By chromosome", loc="left", pad=12)
@@ -632,6 +771,17 @@ def fig_summary(peaks, s, plt, path, title=None):
     fig.text(0.06, 0.925, f"{sub}{extra}", ha="left", fontsize=FS_SUB,
              color=INK, va="bottom")
     return savefig(fig, path)
+
+
+def qc_figure(peaks: NestedPeakSet, path: str, title: Optional[str] = None,
+              qc: Optional[Dict] = None) -> str:
+    """The one-page QC figure of a run (see ``fig_summary``): written by
+    ``callpeak --figures``.  Returns the path."""
+    if len(peaks) == 0:
+        raise ValueError("no regions in the call set: nothing to plot")
+    plt = apply_style()
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    return fig_summary(peaks, peak_stats(peaks), plt, path, title=title, qc=qc)
 
 
 _FIGURES = (

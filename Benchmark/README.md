@@ -8,47 +8,63 @@ python Benchmark/run_benchmark.py     # ~7 min: run every method on every datase
 python Benchmark/make_figures.py      # render Benchmark/figures/
 ```
 
-> **This is not the benchmark specified in [docs/DESIGN.md §9–10](../docs/DESIGN.md).**
-> That one requires experimental data, held-out datasets and the published
-> software for every comparator. This is a controlled comparison on simulation,
-> and half the comparators are re-implementations rather than the real tools
-> (§2). It is a regression harness and a sanity check, not evidence for a paper.
+> **This is a controlled comparison on simulated data, not an evaluation on
+> experimental data** (see [docs/DESIGN.md §11–12](../docs/DESIGN.md)). Two of
+> the comparators are re-implementations rather than the published tools (§2).
+> It serves as a regression harness and a check of the method's behaviour
+> where the truth is known.
 
 ---
 
 ## 1. Headline results
 
-Base-pair F1 against known truth, all methods at their own nominal FDR 5%:
+Base-pair F1 against known truth, all methods at their own nominal FDR 5%
+(run on the PARCC cluster, 2026-11-06; `results/versions.txt`):
 
-| Method | narrow | broad | mixed | low quality |
-|---|---:|---:|---:|---:|
-| **FlexPeak (defaults)** | **93%** | **99%** | **99%** | **96%** |
-| FlexPeak (self-tuned) | **93%** | **99%** | **99%** | **96%** |
-| FlexPeak (preset h3k27me3) | 84% | 95% | 93% | 67% |
-| MACS2 / MACS3 narrow | 90% | 52% | 55% | 15% |
-| MACS2 / MACS3 broad | 80% | 94% | 94% | 44% |
-| SICER/epic2-style, defaults | 11% | 94% | 95% | 54% |
-| SICER/epic2-style, tuned | 17% | 97% | 97% | 63% |
-| DESeq2/csaw-style, 200 bp | 61% | 0% | 8% | 0% |
-| DESeq2/csaw-style, 5 kb | 21% | 98% | 92% | 56% |
-| FlexPeak, Poisson background (ablation) | 82% | 99% | 98% | 66% |
+| Method | narrow | broad | mixed | low quality | sparse (CUT&RUN-like) | null calls |
+|---|---:|---:|---:|---:|---:|---:|
+| **FlexPeak (defaults)** | **91%** | **100%** | **99%** | **96%** | **99%** | 2 |
+| FlexPeak (self-tuned) | 91% | 99% | 99% | 96% | 99% | 2 |
+| FlexPeak (preset h3k27me3) | 85% | 95% | 95% | 55% | 98% | 4 |
+| MACS2 2.2.9.1 narrow | 90% | 52% | 55% | 15% | 20% | 18 |
+| MACS2 2.2.9.1 broad | 80% | 94% | 94% | 44% | 59% | 121 |
+| MACS3 3.0.4 narrow / broad | 90% / 80% | 52% / 94% | 55% / 94% | 15% / 44% | 20% / 59% | 18 / 121 |
+| **SICER2 1.0.3** (W200 G600) | 16% | 98% | 96% | 63% | 97% | 430 |
+| SICER2 broad (W1000 G3000) | 0% | 92% | 93% | 0% | 94% | 58 |
+| **SEACR 1.3** stringent, control, norm | 2% | 0% | 0% | 39% | 89% | 0 |
+| SEACR relaxed, control, norm | 2% | 0% | 0% | 46% | 94% | 1 |
+| SEACR stringent, no control, top 1% | 0% | 0% | 0% | 39% | 74% | 0 |
+| SICER/epic2-style (re-impl.), tuned | 17% | 97% | 97% | 63% | 98% | 286 |
+| DESeq2/csaw-style NB (re-impl.), 5 kb | 21% | 98% | 92% | 56% | 92% | 0 |
+| FlexPeak, Poisson background (ablation) | 78% | 99% | 98% | 67% | 95% | 39 |
 
-Four results matter:
+What the table says:
 
-1. **FlexPeak handles all three scales with one parameter set.** Every other
-   method has a configuration that is good on narrow *or* broad and bad on the
-   other. This is the design claim, and on this data it holds.
-2. **FlexPeak's boundaries are an order of magnitude tighter** on broad
-   domains: median |Δstart| 338 bp, against 18,944 bp for MACS broad, 1,112 bp
-   for the tuned SICER-style baseline and 1,075 bp for 5 kb NB windows.
-3. **The self-tuner no longer degrades anything.** Its previous version
-   collapsed to F1 7% on mixed and 8% on low-quality data; after the objective
-   was made two-sided (§5.1) it reproduces the defaults on every dataset. It
-   still does not *improve* on them here, and §5.1 records where it cannot.
-4. **Low-quality data is now FlexPeak's clearest win over the baselines:**
-   F1 96% against 44% (MACS broad), 63% (tuned SICER-style) and 66% (1 kb
-   windows). The change was a single default — the 1.5× fold floor that had
-   been erasing every 1.6× domain (§5.4).
+1. **One parameter set across all five scales.** Every other tool has a
+   setting that is good on narrow *or* broad data and poor on the other.
+   SICER2 is the strongest broad-domain comparator (98%) and collapses on
+   focal peaks (16%); MACS is the reverse.
+2. **The real SICER2 confirms the over-merge claim** the re-implementation
+   had only suggested: 430 islands covering 17.6% of a genome with no signal
+   at its default settings, 58 islands / 13.8% at the broad settings, against
+   2 regions / 0.02% for FlexPeak. On the broad dataset its boundaries are
+   4x looser (median |Δstart| 1,425 bp vs 338 bp).
+3. **SEACR is a CUT&RUN tool and behaves like one.** Its region unit is a
+   block of contiguous non-zero signal; on dense ChIP-like coverage a block
+   spans hundreds of kb, so it scores ~0 on narrow, broad and mixed. On the
+   `sparse` dataset, built for it (near-empty background, high-contrast
+   peaks), it reaches 89-94%; FlexPeak reaches 99% there without a preset.
+4. **Low-quality data remains the clearest separation**: 96% against 63%
+   (SICER2), 44% (MACS broad), 46% (SEACR relaxed).
+5. **The self-tuner reproduces the defaults** on every dataset (within 1
+   point) and costs about 3 s on this genome. The `h3k27me3` preset row
+   fell on the low-quality set (67% -> 56%) when its background windows
+   were widened to 1 Mb / 5 Mb: on a 3 Mb simulated
+   chromosome those windows degenerate to half-chromosome means. The
+   presets are uncalibrated fallbacks; the widening was measured on
+   experimental H3K27me3, where it is what makes weak domains callable. The quick scan (`--quick`) is
+   not evaluated here: on simulation the defaults are already the right
+   answer, so its benefit can only be seen on experimental data.
 
 ![F1 heatmap](figures/B1_f1_heatmap.png)
 
@@ -56,26 +72,18 @@ Four results matter:
 
 | Comparator | Status |
 |---|---|
-| **MACS2 2.2.9.1** | Real tool, executed as a subprocess. Version and command line recorded. |
-| **MACS3 3.0.0b3** | Real tool, executed as a subprocess. Identical results to MACS2 on every dataset here. |
-| **SICER2 / epic2** | **Not run.** `pip install epic2 SICER2` fails on this machine: `epic2`, `ncls` and `sorted_nearest` cannot build C extensions. Replaced by a re-implementation of the island algorithm. |
-| **DESeq2** | **Not run.** `BiocManager::install("DESeq2")` fails on R 4.1.3 here. Replaced by a re-implementation of windowed NB testing. |
-| **SEACR** | **Not run.** Fetching the upstream script was blocked in this environment. No substitute implemented. |
+| **MACS2 2.2.9.1, MACS3 3.0.4** | Real tools, subprocess. Identical calls on every dataset. |
+| **SICER2 1.0.3** | Real tool (`sicer`), subprocess, BED input via `bedtools bamtobed`; `-s mm10` with the effective genome fraction set to the simulated genome's share of mm10 so the background rate is right. Two settings: defaults (W200 G600) and broad (W1000 G3000). |
+| **SEACR 1.3** | Real tool (`SEACR_1.3.sh`, R 4.3.3, bedtools 2.31.1), bedgraph input via `bedtools genomecov -bg`. Three documented modes: control+norm stringent, control+norm relaxed, no-control top 1%. The no-control mode fails with an awk division-by-zero on three dense datasets (recorded in `results/commands.txt`); those cells are 0. |
+| **THOR 1.0.2, MACS2 bdgdiff, SICER2 sicer_df** | Differential comparators, real tools, in `run_diff_benchmark.py` (section 7). |
+| **epic2, DESeq2** | Not run; the re-implemented baselines remain, labelled `(re-impl.)`. |
 | **HMMRATAC, LanceOtron, Genrich, JAMM** | Not attempted. |
 
-**The two re-implemented baselines are labelled `(re-impl.)` everywhere and are
-not evidence about SICER2, epic2 or DESeq2.** They implement the published
-*algorithm*; they are not version-matched, not author-tuned, and any difference
-may be an artefact of this implementation. In particular the SICER-style
-baseline omits the null-derived island-score threshold that real SICER applies
-before FDR control, which is very likely why its null-dataset specificity here
-(§5.3) is worse than the published tools would be.
-
-Both baselines deliberately reuse FlexPeak's NB arithmetic
-(`flexpeak.stats.nbtest`) where NB testing is involved. That is intentional:
-holding the arithmetic fixed isolates the *structural* difference — HMM
-segmentation, local-lambda background, scale-space sub-peaks — instead of
-confounding it with a second implementation of the same maths.
+The two re-implemented baselines are not evidence about the published tools.
+Now that the real SICER2 has run, the re-implementation can be checked
+against it: on broad/mixed/low-quality it is within 1-3 points of the real
+tool, and its null-dataset specificity is worse (286-745 vs 430 islands),
+as the earlier caveat predicted.
 
 ## 3. Protocol
 
@@ -92,6 +100,7 @@ treatment and control. Ground truth is exact by construction.
 | `mixed` | narrow + broad + domains containing sub-peaks (H3K9me3-like) | 74 |
 | `lowqual` | 3× narrow / 1.6× broad, dispersion 0.40 | 86 |
 | `null` | no enrichment anywhere | 0 |
+| `sparse` | CUT&RUN-like: background 0.4 reads / 25 bp bin, 40x narrow / 8x broad peaks | 45 |
 
 Every method reads the **same BAM files** and the same control. FlexPeak's
 coverage cache is disabled and the BAM parse time is added to its wall clock,
@@ -100,7 +109,7 @@ for I/O would flatter it (§5.5).
 
 ### 3.2 Fairness measures
 
-Following [DESIGN.md §10.2](../docs/DESIGN.md):
+Following [DESIGN.md §11](../docs/DESIGN.md):
 
 - All methods run at nominal FDR 5%. Matched call count is not enforced;
   territory is reported alongside every recall number instead.
@@ -144,8 +153,8 @@ meaningful together — a method can score well on one by failing at the other.
 
 | Dataset | Defaults F1 | Self-tuned F1 | Self-tuned F1, previous objective |
 |---|---:|---:|---:|
-| narrow | 93% | 93% | 91% |
-| broad | 99% | 99% | 99% |
+| narrow | 91% | 91% | 91% |
+| broad | 100% | 99% | 99% |
 | mixed | 99% | 99% | **7%** |
 | low quality | 96% | 96% | **8%** |
 
@@ -156,7 +165,7 @@ stops the symmetric failure of calling almost nothing, and a strict setting
 that keeps only the strongest focal peaks is perfectly stable. On mixed data the
 tuner duly chose F1 7% while scoring that setting's stability at 0.98.
 
-The objective is now anchored by a **held-out fit** term (DESIGN.md §3.4,
+The objective is now anchored by a **held-out fit** term (DESIGN.md §7,
 `flexpeak.tune.objective`): the reads are split into two halves, calls are
 made on one, each called piece's fold is read off that half, and the score is
 how much better that piecewise enrichment explains the *other* half's reads
@@ -195,8 +204,8 @@ is for.
 | FlexPeak (defaults / self-tuned) | 2 | 0.02% |
 | MACS2/3 narrow | 18 | 0.03% |
 | MACS2/3 broad | 121 | 0.40% |
-| **FlexPeak, Poisson ablation** | 24 | **0.55%** |
-| FlexPeak (preset h3k27me3) | 5 | 3.54% |
+| **FlexPeak, Poisson ablation** | 39 | **0.80%** |
+| FlexPeak (preset h3k27me3) | 4 | 1.14% |
 | SICER-style (re-impl.) | 85–745 | 24–32% |
 | DESeq2/csaw-style (re-impl.) | 0 | 0.00% |
 
@@ -205,7 +214,7 @@ The correct answer is zero. Two things to read carefully here:
 - **The simulator draws background from the negative binomial family FlexPeak
   assumes**, so FlexPeak is favoured by construction. The comparison that does
   *not* depend on that assumption is FlexPeak against its own Poisson ablation:
-  identical code, one distribution swapped, 0.02% → 0.55%. That is a controlled
+  identical code, one distribution swapped, 0.02% → 0.80%. That is a controlled
   ~25-fold difference and it is the strongest support here for the NB claim.
   (Both figures fell with the FDR change below; the ratio did not.)
 - Region-level FDR is now taken over the number of candidate-sized tiles in
@@ -218,7 +227,7 @@ The correct answer is zero. Two things to read carefully here:
   A Poisson island test on overdispersed background is genuinely
   anti-conservative, but the published tools apply a null-derived score
   threshold this re-implementation lacks.
-- `--preset h3k27me3` calls 3.54% of a null genome, worse than the Poisson
+- `--preset h3k27me3` calls 1.14% of a null genome, more than the Poisson
   ablation. This corroborates the main README's statement that the presets are
   uncalibrated placeholders and should not be used.
 
@@ -246,28 +255,29 @@ The correct answer is zero. Two things to read carefully here:
   broad data, and far simpler. FlexPeak's advantage over it appears on `mixed`
   (99% vs 92%) and in boundary error, not on `broad` alone.
 
-### 5.5 Runtime: FlexPeak is slower than MACS here
+### 5.5 Runtime
 
 End to end, with BAM parsing charged to both:
 
-| Method | median wall clock | previously |
-|---|---:|---:|
-| FlexPeak (defaults) | 2.9 s | 12.6 s |
-| MACS2 narrow / broad | 7.5 / 7.5 s | 6.8 / 6.7 s |
-| MACS3 narrow / broad | 8.1 / 7.8 s | 7.3 / 7.2 s |
-| FlexPeak (self-tuned) | 7.6 s | 53.2 s |
+| Method | median wall clock (cluster, 2026-11-05) |
+|---|---:|
+| FlexPeak (defaults) | 3.0 s |
+| FlexPeak (self-tuned) | 6.0 s |
+| MACS2 narrow / broad | 5.2 / 5.3 s |
+| MACS3 narrow / broad | 8.2 / 7.8 s |
+| SICER2 default / broad | 26 / 29 s |
+| SEACR (any mode) | 1.7-3.1 s |
 
-FlexPeak is now **~2.6× faster than MACS2** end to end on this genome, and the
-self-tuner (27 grid points, two read halves each) costs about 5 s on top. The
-changes were: the BAM is scanned once into fragment-anchor arrays and binned
-with `bincount` instead of a per-read Python loop with a second full pass for
-the fragment-length estimate (load 11.7 s → 2.7 s for the pair); the HMM's
-gamma-function coefficient is computed once per chromosome instead of per
-state per EM iteration; sub-peak candidates are tested in one vectorised
-call; and the tuner fits the background and the HMM once per read half and
-re-thresholds them at every grid point. Per-chromosome multiprocessing exists
-in the loader (`load_bam(n_jobs=...)`, `--threads`) but is off at this size,
-where worker start-up costs more than the scan.
+FlexPeak is ~1.7x faster than MACS2 end to end on this genome, and the
+self-tuner (27 grid points, two read halves each) costs about 3 s on top.
+SICER2 is the slowest comparator (its window scoring is pure Python). The
+speed work that produced this is summarised in DESIGN.md §10: the BAM is scanned
+once into fragment-anchor arrays and binned with `bincount`; the HMM's
+gamma-function coefficient is computed once per chromosome; sub-peak
+candidates are tested in one vectorised call; and the tuner fits the
+background and the HMM once per read half and re-thresholds them at every
+grid point. Per-chromosome multiprocessing exists in the loader
+(`--threads`) but is off at this size.
 
 The re-implemented baselines are excluded from this comparison because they
 never touch a BAM.
@@ -287,19 +297,81 @@ never touch a BAM.
    fold floor, the segmentation-bin floor and the sub-peak gate), each
    measured on these same five datasets plus smaller simulations in the test
    suite. They are principled and documented in `CallParams`, but they were
-   chosen with these results in view; the held-out numbers that would show
-   they generalise are the experimental data in `testing/`, not this table.
+   chosen with these results in view; showing that they generalise requires
+   experimental data, not this table.
 5. **A 4.5 Mb genome** is three orders of magnitude smaller than a real one. The
    runtime figure is a smoke test; it says nothing about scaling.
 6. **The evaluation code is part of the FlexPeak repository.** It was written
    after seeing FlexPeak's behaviour, which is a real source of metric-choice
    bias even though every method is scored identically.
 
-## 7. Files
+## 7. Differential calling: FlexPeak diff against THOR, MACS2 bdgdiff and SICER2 sicer_df
+
+`run_diff_benchmark.py` simulates two conditions that share a baseline of
+peaks and domains and differ in known regions (half gains, half losses; half
+narrow, half broad; 3x fold on top of the shared enrichment), two replicates
+per condition with per-region biological jitter (CV 0.15), and one input.
+Four datasets: equal depth, condition B at 50% depth, one replicate per
+condition, and a null with no differential region. Every method is scored
+from signed intervals by one function: base-pair F1 overall and per
+direction, direction accuracy, and calls on the null set.
+
+Base-pair F1 (2026-11-06 cluster run; `results_diff/metrics.tsv`):
+
+| Method | equal depth, 2 reps | B at 50% depth | 1 rep each | null calls (territory) |
+|---|---:|---:|---:|---:|
+| **FlexPeak diff** (background norm) | **97.7%** | **95.2%** | **73.4%** | 0 |
+| FlexPeak diff (TMM norm) | 97.6% | 94.5% | 73.3% | 0 |
+| FlexPeak diff (background norm + input gate) | 97.7% | 91.0% | 73.4% | 0 |
+| **THOR 1.0.2** (defaults) | 90.7% | 62.5% | 64.8% | 493 (6.0%) |
+| THOR (with input) | 51.9% | 78.1% | 3.5% | 4,519 (68.8%) |
+| MACS2 bdgdiff | 6.2% | 60.8% | 56.5% | 0 |
+| SICER2 sicer_df (W200 G600) | 62.0% | 66.9% | 62.7% | 107 (6.1%) |
+
+Direction accuracy is >= 99% for every method on every dataset: the tools
+agree on *which way* a region changes, and differ on which regions and how
+wide. Wall clock per dataset on the 6 Mb genome: FlexPeak 7-11 s (including
+the BAM parse), THOR 150-540 s, sicer_df 110-140 s, bdgdiff 26-31 s.
+
+What the table says:
+
+* **With replicates FlexPeak diff is 7 points ahead of THOR** on equal
+  depth and 33 points ahead when one condition is half as deep: the
+  conditional-on-total emission factors depth out bin by bin, and the
+  background-level normalisation does not read a global signal difference as
+  depth. TMM normalisation gives nearly the same answer here.
+* **THOR calls 493 regions on a null genome** (6% of it) at its default
+  p-value; FlexPeak's region test with region-scale overdispersion calls
+  none. sicer_df is similar to THOR on the null (107 regions, 6%).
+* **Without replicates every method falls**; FlexPeak keeps 73% by using an
+  edgeR-style BCV 0.2 prior for the region test. That number is a statement
+  about the prior, not about the data, and single-sample comparisons should
+  be read that way.
+* **MACS2 bdgdiff** is not a differential caller for regions that are
+  enriched in both conditions: its likelihood ratio puts almost everything in
+  the "common" set on equal-depth data (F1 6%), and only the depth imbalance
+  makes it find the losses.
+* **THOR with input-DNA normalisation** (one input listed per replicate, as
+  THOR requires) helps it on the depth-imbalanced set (62.5% -> 78.1%) and
+  hurts everywhere else; on the null genome it calls 4,519 regions covering
+  69% of the genome. The simulated input shares the treatment's baseline
+  drift exactly, which is the case input normalisation is meant for, so
+  this is not an unfair input. THOR 1.0.2 needed a source patch to run
+  under numpy >= 2, as did SICER2's `sicer_df` (the patches replace
+  deprecated NumPy calls and do not change either tool's results).
+
+Threats to validity are the same as in section 6 -- simulated data from the
+model family FlexPeak assumes, one replicate per setting, evaluation code in
+this repository -- plus one more: the comparators were run at their defaults
+and one documented variant each, not tuned.
+
+## 8. Files
 
 ```
 Benchmark/
 ├── run_benchmark.py            simulate -> run every method -> metrics.tsv
+├── run_diff_benchmark.py       two-condition simulation -> FlexPeak diff / THOR / bdgdiff / sicer_df
+├── make_diff_figures.py        renders figures/D1..D3 from results_diff/metrics.tsv
 ├── methods.py                  method wrappers; tools vs re-implementations
 ├── metrics.py                  all evaluation metrics, one scorer for all
 ├── make_figures.py             renders figures/ from results/metrics.tsv

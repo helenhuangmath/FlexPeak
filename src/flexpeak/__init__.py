@@ -4,7 +4,7 @@ No pretrained model, no training corpus, no ML dependency -- adaptivity comes
 from per-sample self-tuning at runtime.  See docs/DESIGN.md.
 """
 
-__version__ = "0.1.0"
+__version__ = "1.1.0"
 
 from .peaks import NestedPeakSet, Region, SubPeak
 from .signal.coverage import Coverage
@@ -13,6 +13,7 @@ from .background.nb import BackgroundModel
 from .io.load import load_signal
 from .tune.sweep import tune, TuneResult
 from .tune.objective import TuningObjective
+from .scan import scan_coverage, scan_file, ScanProfile
 
 __all__ = [
     "__version__",
@@ -21,4 +22,5 @@ __all__ = [
     "CallParams", "call_peaks", "preset_params", "PRESETS",
     "BackgroundModel",
     "tune", "TuneResult", "TuningObjective",
+    "scan_coverage", "scan_file", "ScanProfile",
 ]

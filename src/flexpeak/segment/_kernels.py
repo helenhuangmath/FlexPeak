@@ -4,7 +4,7 @@ The forward and backward recursions are inherently sequential over bins, so
 they cannot be vectorised the way the rest of the pipeline is.  At 25 bp bins a
 human chromosome is millions of bins, and a pure-Python loop over them costs
 seconds *per EM iteration* -- which would put the runtime tuning sweep
-(DESIGN.md section 8) out of reach entirely.
+(DESIGN.md section 7) out of reach entirely.
 
 These kernels are therefore JIT-compiled with numba when it is available, and
 fall back to an equivalent NumPy implementation when it is not.  numba stays an
@@ -243,3 +243,17 @@ def viterbi(log_e: np.ndarray, A: np.ndarray, pi: np.ndarray, use_numba=None) ->
     if use_numba and HAVE_NUMBA:
         return _viterbi(log_e, np.ascontiguousarray(log_A), np.ascontiguousarray(log_pi))
     return _viterbi_np(log_e, log_A, log_pi)
+
+
+def warm_up() -> None:
+    """Compile (or load from the on-disk cache) the numba kernels now.
+
+    Called in the parent before worker processes fork: each child otherwise
+    spends ~2 s loading the same compiled code for itself.
+    """
+    if not HAVE_NUMBA:
+        return
+    log_e = np.log(np.full((3, 16), 0.5))
+    A = np.full((3, 3), 1.0 / 3.0)
+    pi = np.full(3, 1.0 / 3.0)
+    forward_backward(log_e, A, pi)

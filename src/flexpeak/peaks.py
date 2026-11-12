@@ -2,7 +2,7 @@
 
 This module is deliberately the first thing defined in the package: every other
 module reads or writes these objects, so its shape is the most expensive thing
-to change later (DESIGN.md section 3.3).
+to change later (DESIGN.md section 6).
 
 A ``Region`` is one contiguous enriched interval. It is either:
 
@@ -45,7 +45,7 @@ class SubPeak:
     neg_log10_q: float = 0.0
     fold_enrichment: float = 0.0
     persistence: int = 0
-    """Number of smoothing scales at which this maximum survived (DESIGN 3.3)."""
+    """Number of smoothing scales at which this maximum survived (DESIGN.md 6)."""
     name: str = ""
 
     @property
@@ -77,6 +77,11 @@ class Region:
     """Mean HMM posterior of being enriched across the region."""
     subpeaks: List[SubPeak] = field(default_factory=list)
     name: str = ""
+    source: str = "hmm"
+    """``"hmm"`` for a first-pass segmentation region, ``"focal"`` for a
+    focal-pass peak reported standalone.  The focal pass already corrected
+    its positions genome-wide, so the region-level FDR treats the two
+    differently (see ``caller._apply_fdr``)."""
 
     @property
     def width(self) -> int:
@@ -187,9 +192,29 @@ class NestedPeakSet:
         """
         if not intervals:
             return self
+        # Covered bp below any position, from the merged intervals' prefix
+        # sums: one searchsorted per region instead of re-merging the whole
+        # exclusion list for every region (20+ s on 70,000 ATAC peaks).
+        import numpy as np
+
+        merged = _merge_sorted(intervals)
+        index = {}
+        for chrom, ivs in merged.items():
+            st = np.array([a for a, _ in ivs], dtype=np.int64)
+            en = np.array([b for _, b in ivs], dtype=np.int64)
+            index[chrom] = (st, en, np.concatenate([[0], np.cumsum(en - st)]))
+
+        def covered(chrom, x):
+            st, en, cum = index[chrom]
+            i = int(np.searchsorted(st, x, side="right"))  # intervals starting <= x
+            if i == 0:
+                return 0
+            return int(cum[i - 1] + min(x, en[i - 1]) - st[i - 1])
+
         keep = []
         for r in self.regions:
-            ov = interval_overlap_bp([(r.chrom, r.start, r.end)], intervals)
+            ov = (covered(r.chrom, r.end) - covered(r.chrom, r.start)
+                  if r.chrom in index else 0)
             if ov > min_overlap_frac * r.width:
                 continue
             keep.append(r)
