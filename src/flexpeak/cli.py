@@ -266,7 +266,7 @@ def build_parser() -> argparse.ArgumentParser:
                          "M-values over informative bins), total (library size)")
     dp.add_argument("-q", "--qvalue", type=float, default=0.05, help="FDR cutoff")
     dp.add_argument("--min-fold", type=float, default=1.5,
-                    help="minimum |fold change| between conditions (default 1.5)")
+                    help="minimum absolute fold change between conditions (default 1.5)")
     dp.add_argument("--min-count", type=float, default=10.0,
                     help="minimum normalised counts in a region, summed over "
                          "conditions (default 10)")

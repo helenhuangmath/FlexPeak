@@ -340,6 +340,9 @@ experimental data is provided in
 
 ## Documentation
 
+The full documentation is at <https://flexpeak.readthedocs.io>, built from
+`docs/` with Sphinx (`sphinx-build docs docs/_build/html`).
+
 | Document | Contents |
 |---|---|
 | [docs/TUTORIAL.md](docs/TUTORIAL.md) | A worked example: a first call, interpreting the output and the QC report, and inspecting a locus. |

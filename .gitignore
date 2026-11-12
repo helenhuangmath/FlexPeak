@@ -7,6 +7,8 @@ __pycache__/
 build/
 examples/tutorial_out/
 examples/geo_out/
+examples/figures_out/
+docs/_build/
 .flexpeak_cache/
 
 # Benchmark inputs and raw outputs live outside the repository (symlinked here)

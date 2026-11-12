@@ -9,7 +9,7 @@ and non-overlapping, and the QC values are in a sane range.
     python examples/geo_h3k9me3.py              # chr1-19 and chrX
 
 Downloads, cache and results go to examples/geo_out/ (not version-controlled);
---keep-figures also writes the tutorial figures to docs/figures/tutorial/.
+--keep-figures also writes the tutorial figure to docs/figures/tutorial/.
 """
 
 from __future__ import annotations
@@ -31,10 +31,9 @@ GEO_URL = (
 GEO_NAME = "GSE285245_pool_H3K9me3_Cl13.bw"
 MAIN_CHROMS = [f"chr{i}" for i in range(1, 20)] + ["chrX"]
 
-# Figures from this run that the tutorial embeds.  --keep-figures writes them as
+# The figure from this run that the tutorial embeds.  --keep-figures writes it as
 # PNG (Markdown cannot render PDF) into docs/figures/tutorial/, which is tracked.
-TUTORIAL_FIGURES = ["summary", "width_distribution", "enrichment",
-                    "width_vs_enrichment"]
+TUTORIAL_FIGURES = ["summary"]
 TUTORIAL_FIGDIR = os.path.join(ROOT, "docs", "figures", "tutorial")
 
 
@@ -68,7 +67,7 @@ def main(argv=None) -> int:
     ap.add_argument("--no-figures", action="store_true",
                     help="skip the statistics figures (they need matplotlib)")
     ap.add_argument("--keep-figures", action="store_true",
-                    help="also write the tutorial figures as PNG into "
+                    help="also write the tutorial figure as PNG into "
                          "docs/figures/tutorial/")
     args = ap.parse_args(argv)
 
